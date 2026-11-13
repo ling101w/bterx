@@ -1,0 +1,960 @@
+{
+  "captured_at": "2026-11-13T14:39:43.180153+08:00",
+  "agents": [
+    {
+      "key": "goals",
+      "name": "目标拆解",
+      "role": "goals",
+      "enabled": true,
+      "max_turns": 0,
+      "run_seconds": 1200,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 0,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": false,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "planner",
+      "name": "规划",
+      "role": "planner",
+      "enabled": true,
+      "max_turns": 16,
+      "run_seconds": 240,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 2,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": true,
+      "interactive_shell": true,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "mainagent",
+      "name": "主",
+      "role": "main",
+      "enabled": true,
+      "max_turns": 0,
+      "run_seconds": 1200,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 0,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": true,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "worker",
+      "name": "执行",
+      "role": "worker",
+      "enabled": true,
+      "max_turns": 0,
+      "run_seconds": 1200,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 0,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": true,
+      "interactive_shell": true,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "auto",
+      "name": "Auto",
+      "role": "assistant",
+      "enabled": true,
+      "max_turns": 0,
+      "run_seconds": 1200,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 0,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": true,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "pentest",
+      "name": "渗透测试",
+      "role": "assistant",
+      "enabled": true,
+      "max_turns": 0,
+      "run_seconds": 0,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 0,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": true,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "reporter",
+      "name": "报告撰写",
+      "role": "assistant",
+      "enabled": true,
+      "max_turns": 0,
+      "run_seconds": 1200,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 0,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": false,
+      "trigger_run_mode": "parallel",
+      "trigger_merge_mode": "none",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "retester",
+      "name": "漏洞复测",
+      "role": "assistant",
+      "enabled": true,
+      "max_turns": 0,
+      "run_seconds": 1200,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 0,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": false,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "asset_mapper",
+      "name": "资产梳理",
+      "role": "assistant",
+      "enabled": true,
+      "max_turns": 0,
+      "run_seconds": 1200,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 0,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": false,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "credential_processor",
+      "name": "凭据整理",
+      "role": "assistant",
+      "enabled": true,
+      "max_turns": 1,
+      "run_seconds": 1200,
+      "wrapup_prompt": "",
+      "wrapup_max_turns": 0,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": false,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 5
+    },
+    {
+      "key": "chain_reviewer",
+      "name": "链路复盘",
+      "role": "assistant",
+      "enabled": true,
+      "max_turns": 4,
+      "run_seconds": 180,
+      "wrapup_prompt": "尽快用 chain_review_publish 保存能引用原始证据的报告；不能编造候选。已经保存就只报告编号与交接状态。",
+      "wrapup_max_turns": 1,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": false,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "none",
+      "trigger_max_parallel": 1
+    },
+    {
+      "key": "experience_curator",
+      "name": "经验整理",
+      "role": "assistant",
+      "enabled": true,
+      "max_turns": 6,
+      "run_seconds": 180,
+      "wrapup_prompt": "停止整理，不运行命令或访问目标；只如实报告已保存的经验及未完成原因。",
+      "wrapup_max_turns": 1,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": false,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "all",
+      "trigger_max_parallel": 1
+    },
+    {
+      "key": "experience_retriever",
+      "name": "经验检索",
+      "role": "assistant",
+      "enabled": true,
+      "max_turns": 4,
+      "run_seconds": 100,
+      "wrapup_prompt": "立即停止检索，只根据已读到的经验给出简短答复；未检索成功如实说明。",
+      "wrapup_max_turns": 1,
+      "task_timeout_wrapup_prompt": "",
+      "task_timeout_wrapup_max_turns": 0,
+      "web_search": false,
+      "interactive_shell": false,
+      "trigger_run_mode": "serial",
+      "trigger_merge_mode": "none",
+      "trigger_max_parallel": 1
+    }
+  ],
+  "settings": [
+    {
+      "key": "agent_traffic_binding",
+      "value": "true"
+    },
+    {
+      "key": "credential_agent_enabled",
+      "value": "true"
+    },
+    {
+      "key": "llm_judge_ask_timeout_action",
+      "value": "deny"
+    },
+    {
+      "key": "llm_judge_ask_timeout_seconds",
+      "value": "300"
+    },
+    {
+      "key": "llm_judge_enabled",
+      "value": "true"
+    },
+    {
+      "key": "llm_judge_fail_action",
+      "value": "allow"
+    },
+    {
+      "key": "llm_judge_retry_count",
+      "value": "3"
+    },
+    {
+      "key": "llm_judge_retry_interval_ms",
+      "value": "1000"
+    },
+    {
+      "key": "llm_judge_timeout_seconds",
+      "value": "15"
+    },
+    {
+      "key": "task_intelligence_enabled",
+      "value": "true"
+    },
+    {
+      "key": "workers",
+      "value": "5"
+    }
+  ],
+  "tool_bindings": [
+    {
+      "key": "add_company_scope",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner",
+        "auto"
+      ]
+    },
+    {
+      "key": "add_hint",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent"
+      ]
+    },
+    {
+      "key": "add_intent",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner"
+      ]
+    },
+    {
+      "key": "add_task_hint",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "add_task_scope",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner"
+      ]
+    },
+    {
+      "key": "ask_experience",
+      "system": false,
+      "enabled": true,
+      "kind": "script",
+      "agents": [
+        "planner",
+        "mainagent",
+        "worker",
+        "auto",
+        "pentest"
+      ]
+    },
+    {
+      "key": "bind_finding_traffic",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "reporter",
+        "auto"
+      ]
+    },
+    {
+      "key": "chain_review_publish",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "chain_reviewer"
+      ]
+    },
+    {
+      "key": "chain_review_snapshot",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "chain_reviewer"
+      ]
+    },
+    {
+      "key": "complete_finding_case_review",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "reporter"
+      ]
+    },
+    {
+      "key": "create_custom_tool",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "create_mcp",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "create_skill",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "delete_assets_by_host",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "expand_digest",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner"
+      ]
+    },
+    {
+      "key": "experience_feedback",
+      "system": false,
+      "enabled": true,
+      "kind": "script",
+      "agents": [
+        "planner",
+        "mainagent",
+        "worker",
+        "auto",
+        "pentest"
+      ]
+    },
+    {
+      "key": "experience_get",
+      "system": false,
+      "enabled": true,
+      "kind": "script",
+      "agents": [
+        "planner",
+        "mainagent",
+        "worker",
+        "auto",
+        "pentest",
+        "experience_retriever"
+      ]
+    },
+    {
+      "key": "experience_publish",
+      "system": false,
+      "enabled": true,
+      "kind": "script",
+      "agents": [
+        "experience_curator"
+      ]
+    },
+    {
+      "key": "experience_search",
+      "system": false,
+      "enabled": true,
+      "kind": "script",
+      "agents": [
+        "planner",
+        "mainagent",
+        "worker",
+        "auto",
+        "pentest",
+        "experience_retriever"
+      ]
+    },
+    {
+      "key": "experience_snapshot",
+      "system": false,
+      "enabled": true,
+      "kind": "script",
+      "agents": [
+        "experience_curator"
+      ]
+    },
+    {
+      "key": "experience_stats",
+      "system": false,
+      "enabled": true,
+      "kind": "script",
+      "agents": [
+        "planner",
+        "mainagent",
+        "worker",
+        "auto",
+        "pentest",
+        "experience_retriever"
+      ]
+    },
+    {
+      "key": "get_finding_case",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "reporter"
+      ]
+    },
+    {
+      "key": "get_finding_record",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "reporter"
+      ]
+    },
+    {
+      "key": "get_finding_retest_context",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "retester"
+      ]
+    },
+    {
+      "key": "get_finding_traffic",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto",
+        "reporter",
+        "worker",
+        "planner",
+        "mainagent",
+        "pentest"
+      ]
+    },
+    {
+      "key": "get_task_graph",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto",
+        "reporter"
+      ]
+    },
+    {
+      "key": "get_task_node_detail",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto",
+        "reporter"
+      ]
+    },
+    {
+      "key": "get_task_worker_trace",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto",
+        "reporter"
+      ]
+    },
+    {
+      "key": "get_worker_output",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner"
+      ]
+    },
+    {
+      "key": "get_worker_trace",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner",
+        "worker"
+      ]
+    },
+    {
+      "key": "goal_met",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": []
+    },
+    {
+      "key": "graph_overview",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner"
+      ]
+    },
+    {
+      "key": "insert_assets",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "worker",
+        "auto",
+        "pentest"
+      ]
+    },
+    {
+      "key": "kill_work",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "planner"
+      ]
+    },
+    {
+      "key": "list_assets",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner",
+        "worker",
+        "auto",
+        "pentest"
+      ]
+    },
+    {
+      "key": "list_companies",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "planner",
+        "auto",
+        "pentest"
+      ]
+    },
+    {
+      "key": "list_facts",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner"
+      ]
+    },
+    {
+      "key": "list_findings",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner",
+        "worker",
+        "pentest"
+      ]
+    },
+    {
+      "key": "list_goals",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "planner"
+      ]
+    },
+    {
+      "key": "list_llm_profiles",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "list_task_findings",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto",
+        "reporter"
+      ]
+    },
+    {
+      "key": "list_task_worker_traces",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto",
+        "reporter"
+      ]
+    },
+    {
+      "key": "list_tasks",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "list_untested_assets",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner"
+      ]
+    },
+    {
+      "key": "merge_finding_records",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "reporter"
+      ]
+    },
+    {
+      "key": "node_detail",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner",
+        "worker"
+      ]
+    },
+    {
+      "key": "pause_task",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "prove_goal",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "planner"
+      ]
+    },
+    {
+      "key": "record_fact",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "worker"
+      ]
+    },
+    {
+      "key": "record_finding_retest_result",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "retester"
+      ]
+    },
+    {
+      "key": "record_intelligence",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "worker"
+      ]
+    },
+    {
+      "key": "report_finding",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner",
+        "worker",
+        "auto",
+        "pentest"
+      ]
+    },
+    {
+      "key": "search_all_worker_traces",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner",
+        "worker"
+      ]
+    },
+    {
+      "key": "search_finding_duplicates",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "reporter"
+      ]
+    },
+    {
+      "key": "search_task_worker_traces",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto",
+        "reporter"
+      ]
+    },
+    {
+      "key": "set_constraints",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "goals"
+      ]
+    },
+    {
+      "key": "set_goals",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "goals"
+      ]
+    },
+    {
+      "key": "spawn_task",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "steer_work",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "mainagent",
+        "planner"
+      ]
+    },
+    {
+      "key": "suggest_finding_merge",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "reporter"
+      ]
+    },
+    {
+      "key": "traffic_blob",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "worker",
+        "reporter"
+      ]
+    },
+    {
+      "key": "traffic_get",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "worker",
+        "reporter"
+      ]
+    },
+    {
+      "key": "traffic_search",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "worker",
+        "reporter"
+      ]
+    },
+    {
+      "key": "update_custom_tool",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "update_finding_case_report",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "reporter"
+      ]
+    },
+    {
+      "key": "update_finding_report",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto",
+        "reporter"
+      ]
+    },
+    {
+      "key": "update_mcp",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    },
+    {
+      "key": "update_skill_file",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "auto"
+      ]
+    }
+  ],
+  "model_bindings": "Model choices and credentials are intentionally configured locally; this preset does not contain profile IDs or keys."
+}
