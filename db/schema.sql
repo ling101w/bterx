@@ -1638,3 +1638,21 @@ CREATE INDEX IF NOT EXISTS idx_task_intelligence_assets ON task_intelligence USI
 
 -- Optional derived credential presentation; raw intelligence remains authoritative.
 ALTER TABLE task_intelligence ADD COLUMN IF NOT EXISTS credential_analysis JSONB;
+
+-- Structured method adoption is independent of task evidence truth.
+CREATE SCHEMA IF NOT EXISTS artex_experience;
+CREATE TABLE IF NOT EXISTS "artex_experience".intent_experiences (
+    exploration_id BIGINT NOT NULL, task_id BIGINT NOT NULL, intent_id BIGINT NOT NULL,
+    experience_id TEXT NOT NULL, experience_revision TEXT NOT NULL, method_snapshot JSONB NOT NULL,
+    adopted_at TIMESTAMPTZ NOT NULL DEFAULT now(), result_state TEXT NOT NULL DEFAULT 'pending_execution',
+    terminal_state TEXT NOT NULL DEFAULT '', evidence_node_ids JSONB NOT NULL DEFAULT '[]',
+    evidence_activity_ids JSONB NOT NULL DEFAULT '[]', feedback_state TEXT NOT NULL DEFAULT 'awaiting_execution',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(intent_id,experience_id)
+);
+CREATE INDEX IF NOT EXISTS experience_intent_results
+    ON "artex_experience".intent_experiences(task_id,result_state,feedback_state);
+
+-- New optional property; preserve user descriptions and bindings.
+UPDATE tools SET schema=jsonb_set(schema,'{properties,experience_refs}',
+ '{"type":"array","maxItems":3,"description":"实际采用的经验id和刚读取的revision；程序自动记adopted，不是当前事实或授权","items":{"type":"object","properties":{"id":{"type":"string"},"revision":{"type":"string"}},"required":["id","revision"]}}'::jsonb,true)
+WHERE key='add_intent' AND system AND NOT (coalesce(schema->'properties','{}') ? 'experience_refs');

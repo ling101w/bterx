@@ -90,6 +90,8 @@ def validate_request(payload):
     if not isinstance(tags, list) or len(tags) > 8 or any(not isinstance(t, str) or not 1 <= len(t) <= 60 for t in tags):
         raise ValueError("Invalid tags")
     limit = bounded(payload.get("limit", 3), 3, "limit", 1)
+    if payload.get("mode", "lookup") not in ("lookup", "analyze"):
+        raise ValueError("mode must be lookup or analyze")
     return task_id, question.strip(), tags, limit
 
 
@@ -125,6 +127,51 @@ def strict_tool_output(row):
     if not isinstance(value, dict):
         raise RetrievalError("Experience reader produced a malformed tool record")
     return value
+
+
+def brief_card(card):
+    """Return a bounded method card without raw source evidence or task IDs."""
+    brief = {key: card.get(key) for key in ("id", "revision", "title", "category", "tags", "status", "outcome", "transfer_scope")}
+    brief["title"] = str(brief["title"] or "")[:120]
+    brief["category"] = str(brief["category"] or "")[:60]
+    brief["tags"] = [str(tag)[:40] for tag in (brief["tags"] or [])[:5]]
+    for key, maximum in (("applicable_when", 600), ("success_criteria", 500),
+                         ("not_applicable", 600), ("root_cause", 600)):
+        brief[key] = str(card.get(key) or "")[:maximum]
+    brief["steps"] = [str(value)[:450] for value in (card.get("steps") or [])[:4]]
+    brief["attack_chain"] = [{key: value if key == "step" else str(value)[:450]
+                              for key, value in link.items() if key in
+                              ("step", "prerequisite", "action", "observed_result")}
+                             for link in (card.get("attack_chain") or [])[:6]]
+    while len(json.dumps(brief, ensure_ascii=False).encode("utf-8")) > 4000:
+        brief["truncated"] = True
+        for key in ("applicable_when", "success_criteria", "not_applicable", "root_cause"):
+            brief[key] = brief[key][:max(48, len(brief[key]) * 2 // 3)]
+        brief["steps"] = [value[:max(64, len(value) * 2 // 3)] for value in brief["steps"]]
+        for link in brief["attack_chain"]:
+            for key in ("prerequisite", "action", "observed_result"):
+                if key in link:
+                    link[key] = link[key][:max(48, len(link[key]) * 2 // 3)]
+        if len(brief["attack_chain"]) > 1:
+            brief["attack_chain"].pop()
+        elif len(brief["steps"]) > 1:
+            brief["steps"].pop()
+    return brief
+
+
+def lookup(runtime, task_id, question, tags, limit):
+    """The normal path is a database lookup; no native conversation is started."""
+    matches = runtime.search({"task_id": task_id, "query": question[:700],
+                              "tags": tags, "limit": limit})["experiences"]
+    cards = [brief_card(runtime.get({"id": match["id"], "task_id": task_id})["experience"])
+             for match in matches[:limit]]
+    answer = "未找到相关经验。" if not cards else "以下是匹配的历史经验，请先核对当前前提：\n" + "\n".join(
+        f"- {card['id']}（{card.get('status')}）：{card.get('title')}。"
+        f"适用条件：{card.get('applicable_when')}；限制：{card.get('not_applicable')}"
+        for card in cards)
+    return {"task_id": task_id, "mode": "lookup", "completed": True,
+            "agent_started": False, "answer": answer, "experiences": cards,
+            "notice": "候选须在当前任务验证；需要比较链路和迁移条件时可显式使用mode=analyze。"}
 
 
 def collect_answer(database, conversation_id, task_id, limit):
@@ -187,16 +234,7 @@ def collect_answer(database, conversation_id, task_id, limit):
         card = validated[entry_id]
         # Keep the planner answer below its tool-output budget. Raw report and
         # command evidence stay behind the separate scoped experience_get tool.
-        brief = {key: card.get(key) for key in ("id", "title", "category", "tags", "status", "outcome", "transfer_scope")}
-        for key, maximum in (("applicable_when", 600), ("success_criteria", 500),
-                             ("not_applicable", 600), ("root_cause", 600)):
-            brief[key] = str(card.get(key) or "")[:maximum]
-        brief["steps"] = [str(value)[:450] for value in (card.get("steps") or [])[:4]]
-        brief["attack_chain"] = [{key: value if key == "step" else str(value)[:450]
-                                  for key, value in link.items() if key in
-                                  ("step", "prerequisite", "action", "observed_result")}
-                                 for link in (card.get("attack_chain") or [])[:6]]
-        cards.append(brief)
+        cards.append(brief_card(card))
     if len(cited_ids) > limit:
         # Keep the caller's result limit without treating valid additional
         # references as an internal error or returning unsupported prose.
@@ -204,7 +242,8 @@ def collect_answer(database, conversation_id, task_id, limit):
             f"- {card['id']}（{card.get('status')}）：{card.get('title')}。"
             f"适用条件：{card.get('applicable_when')}；限制：{card.get('not_applicable')}"
             for card in cards)
-    return {"answer": redact(answer, 6500), "experiences": cards, "tool_calls": calls,
+    return {"answer": redact(answer, 1800), "answer_truncated": len(answer) > 1800,
+            "experiences": cards, "tool_calls": calls,
             "notice": "按需检索结果是历史资料；candidate仍待当前任务验证，采用与否由planner决定。"}
 
 
@@ -214,6 +253,8 @@ def handle(payload, database=None, api=None, *, wait_seconds=MAX_WAIT_SECONDS,
     db = database or Database()
     runtime = Runtime(db)
     runtime.task_exists(task_id)
+    if payload.get("mode", "lookup") == "lookup":
+        return lookup(runtime, task_id, question, tags, limit)
     enabled = db.query(f"SELECT id FROM agents WHERE key='{RETRIEVER_KEY}' AND enabled")
     if not enabled:
         raise RetrievalError("Experience reader agent is disabled or unavailable")
@@ -233,6 +274,7 @@ def handle(payload, database=None, api=None, *, wait_seconds=MAX_WAIT_SECONDS,
             if completed and not status.get("running", False):
                 result = collect_answer(db, conversation_id, task_id, limit)
                 return {"conversation_id": conversation_id, "task_id": task_id,
+                        "mode": "analyze", "agent_started": True,
                         "agent": RETRIEVER_KEY, "completed": True, **result}
             pause(1.2)
         native.request(f"/api/conversations/{conversation_id}/stop", {})

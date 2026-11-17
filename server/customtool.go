@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -273,11 +274,21 @@ func (s *Server) buildCustomTool(t *db.Tool) actool.CoreTool {
 		if params == nil {
 			params = map[string]any{}
 		}
+		if key == "experience_publish" {
+			agent.BindExperiencePublication(ctx, params)
+		}
 		switch kind {
 		case "command":
 			return s.runCommandTool(ctx, execRaw, params, tc)
 		case "script":
-			return s.runScriptTool(ctx, key, execRaw, params, tc)
+			result, err := s.runScriptTool(ctx, key, execRaw, params, tc)
+			if key == "ask_experience" || strings.HasPrefix(key, "experience_") {
+				var payload map[string]any
+				if json.Unmarshal([]byte(result.Flatten()), &payload) != nil || payload == nil || payload["error"] != nil {
+					result.IsError = true
+				}
+			}
+			return result, err
 		case "http":
 			return s.runHTTPTool(ctx, execRaw, params, tc)
 		default:

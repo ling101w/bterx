@@ -22,12 +22,18 @@ class FakeDatabase:
 
     def query(self, sql):
         self.queries.append(sql)
+        if "WITH recent AS MATERIALIZED" in sql:
+            return []
         if "FROM companies c" in sql:
             return copy.deepcopy(self.companies)
         if "FROM tasks WHERE" in sql:
             return [{"id": 99}]
         if 'FROM "isolated_memory_test".entries e' in sql:
             return copy.deepcopy(self.entries)
+        if 'FROM "isolated_memory_test".entries WHERE' in sql:
+            return [{"id": e["id"], "status": e["status"]} for e in self.entries if e.get("status") in ("candidate", "verified")]
+        if "FROM exploration_nodes r JOIN tasks t" in sql:
+            return [{"id": 18}]
         if 'FROM "isolated_memory_test".usage' in sql:
             return [{"id": 1}] if self.retrieved else []
         if "FROM exploration_nodes n JOIN tasks t" in sql:
@@ -388,6 +394,7 @@ class RetrievalTests(unittest.TestCase):
         entry = entry_fixture(status="candidate")
         database = FakeDatabase(entries=[entry])
         result = Runtime(database).feedback({"id": entry["id"], "task_id": 99,
+                                           "intent_id": 17, "evidence_node_ids": [18],
                                            "event": "helpful", "note": "该方法符合前提并减少了重复尝试。"})
         self.assertTrue(result["recorded"])
         writes = "\n".join(database.executions)

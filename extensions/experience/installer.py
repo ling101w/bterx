@@ -79,6 +79,8 @@ def tool_manifest(app_dir, solver_keys, marker, config_path=DEFAULT_CONFIG, sche
     out = []
     for key, definition in TOOL_DEFINITIONS.items():
         bindings = [CURATOR_KEY] if definition["audience"] == "curator" else list(solver_keys)
+        if key == "experience_snapshot":
+            bindings = []  # Host prepares the batch; the curator only publishes.
         if key in ("experience_search", "experience_get", "experience_stats"):
             bindings.append(RETRIEVER_KEY)
         out.append({
@@ -287,7 +289,7 @@ def build_install_sql(meta, state, manifest):
     message, event_message = trigger_messages(marker)
     statements.append(f"""INSERT INTO agent_triggers(agent_key,enabled,interval_sec,on_goal_met,on_task_timeout,
         interval_message,goal_message,task_timeout_message)
-        SELECT {lit(CURATOR_KEY)},true,1800,true,true,{lit(message)},{lit(event_message)},{lit(event_message)}
+        SELECT {lit(CURATOR_KEY)},true,3600,false,true,{lit(message)},{lit(event_message)},{lit(event_message)}
         WHERE NOT EXISTS(SELECT 1 FROM agent_triggers WHERE agent_key={lit(CURATOR_KEY)}
         AND position({lit(marker)} in interval_message)>0);""")
     statements.append("COMMIT;")
@@ -497,14 +499,16 @@ def build_upgrade_sql(args, meta, state, upgrade_id):
         if not untouched:
             plan["skipped"]["trigger:" + key] = "触发器安装后有修改或无法确认基线，保留现状"
             continue
-        if (row.get("interval_message") == message and row.get("goal_message") == event_message
+        if (row.get("interval_sec") == 3600 and not row.get("on_goal_met")
+                and row.get("interval_message") == message and row.get("goal_message") == event_message
                 and row.get("task_timeout_message") == event_message):
             continue
         guard = compare_row_sql(row, TRIGGER_FIELDS)
         statements.append(f"""DO $experience_trigger_upgrade$ BEGIN
           IF NOT EXISTS(SELECT 1 FROM agent_triggers WHERE id={int(row['id'])} AND {guard} FOR UPDATE) THEN
             RAISE EXCEPTION 'experience trigger changed during upgrade'; END IF;
-          UPDATE agent_triggers SET interval_message={lit(message)},goal_message={lit(event_message)},
+          UPDATE agent_triggers SET interval_sec=3600,on_goal_met=false,
+            interval_message={lit(message)},goal_message={lit(event_message)},
             task_timeout_message={lit(event_message)} WHERE id={int(row['id'])};
           END $experience_trigger_upgrade$;""")
         plan["triggers"].append(row["id"])
@@ -550,7 +554,7 @@ def upgrade(args, db, state_path, state):
     message, event_message = trigger_messages(state["marker"])
     for row in meta["triggers"]:
         if row["id"] in plan["triggers"]:
-            expected = dict(row, interval_message=message, goal_message=event_message,
+            expected = dict(row, interval_sec=3600,on_goal_met=False,interval_message=message, goal_message=event_message,
                             task_timeout_message=event_message)
             state.setdefault("managed_triggers", {})[str(row["id"])] = fingerprint(expected, TRIGGER_FIELDS)
     applied = {"id": upgrade_id, "revision": EXTENSION_REVISION, "applied_at": utc_now(),

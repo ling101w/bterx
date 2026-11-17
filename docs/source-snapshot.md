@@ -14,9 +14,9 @@
 
 ## 与运行程序对应关系
 
-运行版本：`0.3.27-opt.2-experience`。
+原始导入对应运行版本：`0.3.27-opt.2-experience`。当前v5发布与验证见[memory-v5.md](memory-v5.md)。
 
-该部署二进制SHA-256：`09f02dcd56b78dcbf11d15fb4058386b5d7bf4ba23d3e3218cf93d2a3a4d670d`。
+该历史部署二进制SHA-256：`09f02dcd56b78dcbf11d15fb4058386b5d7bf4ba23d3e3218cf93d2a3a4d670d`。`source-manifest.json`的文件哈希描述11月13日导入基线，不表示后续代码未改动。
 
 Go构建源码来自部署记录指向的独立source目录；前端源文件取自构建该静态UI的上一阶段source目录。13个Agent提示词另从当前配置导出，因为DB里的system override不等于Go内置默认值。新增README与文档不改变线上运行程序。
 

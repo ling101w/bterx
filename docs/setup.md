@@ -61,6 +61,10 @@ cd extensions/experience
 python3 -m unittest -v test_storage test_runtime test_retrieval test_prompt_priority
 ```
 
+v5还应运行 `test_memory_policy test_curation_runs`。数据库部分需在专用库设置 `ARTEX_EXPERIENCE_REVIEW_TEST=1`，运行 `test_curation_runs integration_review_test`；合成检索评测为 `python3 eval_retrieval.py`，不访问测试目标。
+
+原生采用/宿主测试需要单独的本机 `artex_memory_test*` 数据库：设置 `ARTEX_PG_DSN`、`ARTEX_EXPERIENCE_CONFIG` 和 `ARTEX_EXPERIENCE_NATIVE_TEST=1`，再运行 `go test -p 1 ./agent ./db ./server -run 'TestExperience|TestPlanner|TestChainReviewer' -count=1`。不要指向生产库；这些测试会建表、创建合成任务并清理自己的记录。
+
 真实PostgreSQL回归会新建并清理带随机后缀的隔离schema，只用合成来源。仍应使用专门测试库和配置：
 
 ```bash

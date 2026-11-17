@@ -28,7 +28,12 @@ class IsolatedDatabase(Database):
         return super().query(self._rewrite(sql))
 
     def execute(self, sql):
-        return super().execute(self._rewrite(sql))
+        rewritten = self._rewrite(sql)
+        original_tables = "|".join(SOURCE_TABLES)
+        if re.search(r"\b(?:ALTER\s+TABLE|DROP\s+TABLE|TRUNCATE(?:\s+TABLE)?)\s+(?:public\.)?(?:" + original_tables + r")\b",
+                     rewritten, flags=re.I):
+            raise ValueError("Isolated tests must qualify source-table DDL with their owned schema")
+        return super().execute(rewritten)
 
 
 def run():
@@ -74,6 +79,8 @@ def run():
             (201,11,'finding','worker','done','{{}}',now()),
             (202,11,'finding','worker','done','{{}}',now()),
             (401,44,'fact','worker','done','{{"summary":"Synthetic task ended; no judge proof. flag{{fixture_only}}"}}',now());
+          UPDATE {s}.tasks SET updated_at=now()-interval '30 minutes',completed_at=now()-interval '30 minutes' WHERE id=4;
+          UPDATE {s}.exploration_nodes SET updated_at=now()-interval '30 minutes' WHERE id=401;
           COMMIT;""")
         rt = Runtime(db)
         snapshots = rt.snapshot({"limit": 2, "source_task_id": 1})["sources"]
@@ -123,8 +130,11 @@ def run():
             pass
         checks.append("keyword/CJK retrieval, injection resistance, project/evidence boundaries")
 
+        db.execute("INSERT INTO exploration_nodes VALUES(601,22,'intent','planner','done','{}',now()),(602,22,'fact','worker','done','{}',now())")
+        db.execute("INSERT INTO exploration_edges VALUES(22,601,602,'produces')")
         for unused in range(2):
-            rt.feedback({"task_id": 2, "id": generic_id, "event": "helpful", "note": "Synthetic independent fixture used this method."})
+            rt.feedback({"task_id": 2, "id": generic_id, "event": "helpful", "note": "Synthetic independent fixture used this method.",
+                         "intent_id": 601, "evidence_node_ids": [602]})
         assert db.query(f"SELECT count(*) AS n FROM {s}.usage WHERE event='helpful'")[0]["n"] == 1
         assert rt.stats({})["entries"]
         checks.append("feedback prerequisites, retry deduplication, statistics")

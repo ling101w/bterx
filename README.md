@@ -2,13 +2,15 @@
 
 基于 [ARTEX](https://github.com/RuoJi6/ARTEX) 的授权安全测试 Agent 系统，保留 Go 后端、Next.js 前端和 PostgreSQL 探索图，并加入规划约束、异步链路复盘、报告链路经验整理及按需经验检索。
 
-当前导入的是 `0.3.27-opt.2-experience` 部署对应源码。它是可审阅的源码快照，不包含生产数据库、任务报告、流量、模型密钥或已编译程序。上游代码及 AGPL-3.0 许可证保留；Go module 路径也保留原值，避免改动内部导入。
+当前版本为 `0.3.27-opt.3-memory-v5`：在 v0.3.27 基础上加入宿主验收经验交付、可选意图经验引用和结果待复核队列。11月13日原始导入清单作为历史基线保留；当前代码继续维护。不包含生产数据库、任务报告、流量、模型密钥或已编译程序。上游代码及 AGPL-3.0 许可证保留；Go module路径保留原值。
 
 - [当前架构与 Agent 职责](docs/architecture.md)
 - [已部署优化、收益及限制](docs/optimizations.md)
 - [模型在哪些位置受到约束](docs/model-constraints.md)
 - [构建、扩展安装与验证](docs/setup.md)
 - [来源、快照和验证记录](docs/source-snapshot.md)
+- [与上游 v0.3.30 的实际区别](docs/upstream-comparison-20261117.md)
+- [v5交付、验证与发布](docs/memory-v5.md)
 - [上游原始说明](README.upstream.md)
 
 ## 协作方式
@@ -34,7 +36,7 @@ flowchart TD
     E -. 编号、条件、链路和限制 .-> P
 ```
 
-Planner 负责决策和派发，worker 负责执行。链路复盘检查当前任务的证据与推导，经验整理为后续任务积累可迁移方法，经验检索只在被询问时运行。检索采用 PostgreSQL 标签、关键词和中文片段匹配，再由模型组织回答；没有独立向量数据库，也不强制每轮前置 RAG。
+Planner负责决策和派发，worker负责执行。链路复盘检查当前任务的证据与推导，经验整理由宿主准备来源并核验发布结果。经验查询默认直接用PostgreSQL标签、关键词、中文片段和受控同义词返回卡片；显式分析模式才调用检索Agent。实际采用可关联到意图和执行结果；没有独立向量数据库，也不强制每轮前置RAG。
 
 ## 当前实现的边界
 
@@ -52,7 +54,7 @@ cd ..
 mkdir -p server/webui/dist
 cp -a web/out/. server/webui/dist/
 CGO_ENABLED=0 go build -trimpath -tags embedui \
-  -ldflags='-s -w -X main.version=0.3.27-opt.2-experience' \
+  -ldflags='-s -w -X main.version=0.3.27-opt.3-memory-v5' \
   -o artex ./cmd/artex
 cp config.example.json config.json
 # 在本地 config.json 配置数据库；模型和权限在自己的部署中配置。

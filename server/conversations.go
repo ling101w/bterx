@@ -640,6 +640,12 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 	if ctx.Err() != nil {
 		return
 	}
+	if c.AgentKey == agent.ExperienceCuratorKey {
+		emit := func(rec db.Activity) { _, _ = s.m.pg.AppendConvActivity(c.ID, rec) }
+		s.runCuration(ctx, c, s.convBusyKey(c.ID), emit)
+		_ = s.m.pg.TouchConversation(c.ID)
+		return
+	}
 	// precedence: the conversation agent's own binding → this conversation's pin → global.
 	ca := s.resolveChatAgent(c)
 	if ca == nil {
@@ -958,7 +964,13 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 	s.chatMu.Lock()
 	s.chatBusy[busyKey] = true
 	s.chatMu.Unlock()
-	s.runConversationSync(c, msg, busyKey)
+	if c.AgentKey == agent.ExperienceCuratorKey {
+		ctx, cancel := s.conversationRunContext(c.ID, busyKey)
+		ctx = context.WithValue(ctx, curationSourceKey{}, curationSource{TaskID: item.taskID, Trigger: "trigger"})
+		s.runConversationTurn(ctx, cancel, c, msg, busyKey)
+	} else {
+		s.runConversationSync(c, msg, busyKey)
+	}
 }
 
 // firstLine returns a single-line, length-capped preview (shared with summaries).

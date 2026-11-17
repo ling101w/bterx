@@ -55,6 +55,11 @@ class FakeRuntime:
             raise ValueError("Experience unavailable in this task scope")
         return {"experience": copy.deepcopy(self.cards[payload["id"]])}
 
+    def search(self, payload):
+        if getattr(self.database, "lookup_error", False):
+            raise retrieval.RetrievalError("Synthetic library outage")
+        return {"experiences": [{"id": key} for key in self.cards][:payload["limit"]]}
+
 
 class FakeAPI:
     def __init__(self, statuses=None):
@@ -101,7 +106,7 @@ class RetrievalTests(unittest.TestCase):
 
     def test_success_requires_search_and_returns_scoped_bounded_cards(self):
         database, api = FakeDatabase(), FakeAPI()
-        result = retrieval.handle({"task_id": 42, "question": "权限检查怎么验证？"}, database, api)
+        result = retrieval.handle({"task_id": 42, "question": "权限检查怎么验证？", "mode": "analyze"}, database, api)
         self.assertTrue(result["completed"])
         self.assertEqual(result["conversation_id"], 7)
         self.assertEqual(FakeRuntime.checked_tasks, [42])
@@ -114,7 +119,7 @@ class RetrievalTests(unittest.TestCase):
 
     def test_real_search_with_no_hits_can_return_an_honest_empty_answer(self):
         database = FakeDatabase(transcript(hits=False))
-        result = retrieval.handle({"task_id": 42, "question": "没有经验时怎么办"}, database, FakeAPI())
+        result = retrieval.handle({"task_id": 42, "question": "没有经验时怎么办", "mode": "analyze"}, database, FakeAPI())
         self.assertTrue(result["completed"])
         self.assertEqual(result["experiences"], [])
         self.assertIn("没有检索到", result["answer"])
@@ -158,7 +163,7 @@ class RetrievalTests(unittest.TestCase):
     def test_no_search_is_rejected_and_helper_is_stopped(self):
         api = FakeAPI()
         with self.assertRaises(retrieval.RetrievalError):
-            retrieval.handle({"task_id": 42, "question": "机制"}, FakeDatabase([row("result", detail="想当然回答")]), api)
+            retrieval.handle({"task_id": 42, "question": "机制", "mode": "analyze"}, FakeDatabase([row("result", detail="想当然回答")]), api)
         self.assertTrue(any(path == "/api/conversations/7/stop" for path, _ in api.requests))
 
     def test_search_call_without_successful_result_is_not_a_real_search(self):
@@ -194,7 +199,7 @@ class RetrievalTests(unittest.TestCase):
 
     def test_timeout_stops_only_the_created_helper_conversation(self):
         clock, api = FakeClock(), FakeAPI([{"running": True, "items": []}])
-        result = retrieval.handle({"task_id": 42, "question": "机制"}, FakeDatabase(), api,
+        result = retrieval.handle({"task_id": 42, "question": "机制", "mode": "analyze"}, FakeDatabase(), api,
                                   wait_seconds=2, clock=clock, pause=clock.pause)
         self.assertFalse(result["completed"])
         self.assertEqual(api.requests[-1], ("/api/conversations/7/stop", {}))
@@ -202,13 +207,48 @@ class RetrievalTests(unittest.TestCase):
     def test_disabled_helper_and_invalid_inputs_do_not_start_a_conversation(self):
         api = FakeAPI()
         with self.assertRaises(retrieval.RetrievalError):
-            retrieval.handle({"task_id": 42, "question": "机制"}, FakeDatabase(enabled=False), api)
+            retrieval.handle({"task_id": 42, "question": "机制", "mode": "analyze"}, FakeDatabase(enabled=False), api)
         self.assertEqual(api.requests, [])
         for payload in (None, [], {"task_id": True, "question": "x"}, {"task_id": -1, "question": "x"},
                         {"task_id": 0, "question": " "}, {"task_id": 0, "question": "x", "tags": [3]},
                         {"task_id": 0, "question": "x", "limit": 4}):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 retrieval.validate_request(payload)
+
+
+    def test_default_lookup_never_starts_a_helper_and_hides_raw_sources(self):
+        api = FakeAPI()
+        result = retrieval.handle({"task_id": 42, "question": "权限对照"}, FakeDatabase(enabled=False), api)
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["agent_started"])
+        self.assertEqual(result["mode"], "lookup")
+        self.assertEqual(api.requests, [])
+        self.assertEqual(FakeRuntime.gets, [{"id": REAL_ID, "task_id": 42}])
+        self.assertNotIn("PRIVATE RAW", json.dumps(result))
+
+    def test_lookup_empty_is_honest_but_outage_is_not_reported_as_no_hits(self):
+        FakeRuntime.cards = {}
+        result = retrieval.handle({"task_id": 0, "question": "不存在"}, FakeDatabase(), FakeAPI())
+        self.assertEqual(result["experiences"], [])
+        self.assertIn("未找到", result["answer"])
+        database = FakeDatabase()
+        database.lookup_error = True
+        with self.assertRaises(retrieval.RetrievalError):
+            retrieval.handle({"task_id": 0, "question": "任意查询"}, database, FakeAPI())
+
+    def test_large_multibyte_cards_stay_inside_native_tool_output_budget(self):
+        original = FakeRuntime.cards[REAL_ID]
+        original.update(title="方法" * 60, category="机理" * 30, tags=["标签" * 30] * 8,
+                        applicable_when="前提" * 600, not_applicable="限制" * 500,
+                        success_criteria="验证" * 450, root_cause="根因" * 600,
+                        steps=["步骤" * 450] * 8,
+                        attack_chain=[{"step": i + 1, "prerequisite": "前提" * 300,
+                                       "action": "动作" * 450, "observed_result": "结果" * 450}
+                                      for i in range(6)])
+        FakeRuntime.cards = {char * 24: dict(original, id=char * 24) for char in "abc"}
+        result = retrieval.handle({"task_id": 42, "question": "机理", "limit": 3}, FakeDatabase(), FakeAPI())
+        self.assertLess(len(json.dumps(result, ensure_ascii=False).encode("utf-8")), 20000)
+        self.assertTrue(all(card["truncated"] for card in result["experiences"]))
 
 
 class Response:

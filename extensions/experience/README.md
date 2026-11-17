@@ -4,9 +4,11 @@
 
 ## 工作方式
 
-经验整理 Agent 每 30 分钟，以及目标达成、任务超时时被唤起。事件上下文有明确任务编号时，快照使用 `source_task_id` 限定该任务；周期整理不猜测任务编号。每次只读取少量来源快照，优先从漏洞报告、关联事实和执行证据提炼具体链路，保存有来源引用的候选经验；没有合适来源就结束。
+v5由宿主先准备来源，模型只负责提炼和发布。当前部署每3600秒以及任务超时时触发；事件上下文有明确任务编号时限定该任务。没有来源时程序记录 `no_source`，不调用模型；有来源时固定 `run_id`、版本和快照，模型提交条目或逐来源解释跳过。没有交付最多给一次修正，仍未交付就记 `failed`，自然语言“完成”不能当作入库成功。
 
-独立的“经验检索”Agent 没有定时触发器。planner 在遇到相似机理、路线阻塞或需要组合链路时，可按需调用 `ask_experience`；扩展通过 ARTEX 原生对话 API 为检索 Agent 创建可审计会话，等待有限时间后把经验编号、前提、链路和限制返回调用方。检索 Agent 最多检索三条、详读两条，只绑定 search/get/stats，不绑定发布、反馈或 ask，避免递归。已有证据充分时 planner 可以直接派发，检索不是每轮、首次规划或每个意图的强制前置条件。
+独立的“经验检索”Agent没有定时触发器。`ask_experience` 默认 `lookup` 直接查库，显式 `mode=analyze` 才通过原生会话启动检索 Agent；最多检索三条、详读两条。原生代码在工具装配和执行前分别检查权限：整理角色只允许 publish，检索角色只允许 search/get/stats，禁用默认文件、命令、网络和后台工具。已有证据充分时直接派发，检索不是每轮、首次规划或每个意图的强制前置条件。
+
+Planner实际采用方法时可在 `add_intent` 填 `experience_refs=[{"id":"真实EID","revision":"刚读取的版本"}]`。程序校验范围、版本、来源新鲜度，并在同一事务中创建意图、冻结有限方法摘要和登记 adopted。Worker取得当前仍有效的方法；结束后关联真实结果、进入待复核队列，不自动登记 helpful。按任务调用 `experience_stats` 可查看最近10条待复核记录。
 
 新建的整理与检索 Agent 均使用 `llm_profile_id=NULL`，跟随用户当前激活模型，不固定绑定历史配置。升级不改已有整理 Agent 的模型设置。检索 Agent 默认4轮、100秒；桥接最多等待120秒并在超时后停止该检索会话。问答失败或无匹配不阻止 planner 正常工作。
 
@@ -14,8 +16,8 @@
 
 | 工具 | 用途 | 使用者 |
 | --- | --- | --- |
-| `ask_experience` | 按需询问独立经验检索 Agent，返回条件、链路和编号 | planner及其他解题 Agent |
-| `experience_snapshot` | 获取少量待整理的来源证据快照 | 经验整理 |
+| `ask_experience` | 默认直接查询；复杂分析才启动检索Agent | planner及其他解题 Agent |
+| `experience_snapshot` | 兼容管理员调用；批次由宿主准备 | 不绑定Agent |
 | `experience_publish` | 校验来源并保存经验 | 经验整理 |
 | `experience_search` | 按任务范围、标签和关键词检索 | 解题 Agent、经验检索 |
 | `experience_get` | 读取完整方法、限制和证据摘要 | 解题 Agent、经验检索 |
@@ -28,16 +30,18 @@
 flowchart TD
     A[worker 写回事实和漏洞] --> B[reporter 形成漏洞报告与证据]
     B --> C[经验整理 Agent 定时或事件触发]
-    C --> D[读取有限来源快照]
+    C --> D[宿主准备有限来源并登记run]
     D --> E[提炼方法 根因与有证据链路]
     E --> F[(候选经验库)]
     F --> G[管理员独立方法审核]
     P[planner 按当前证据规划] -->|需要历史方法时 ask_experience| R[独立经验检索 Agent]
     R -->|search / get| F
     R -->|编号 前提 链路 限制| P
-    P -->|核对后 add_intent| W[worker 执行当前意图]
+    P -->|add_intent 可选experience_refs| L[原子保存意图和采用记录]
+    L --> W[worker 执行当前意图]
     W --> A
-    W -->|实际采用及结果反馈| F
+    W --> Q[实际结果关联和待评价队列]
+    Q -->|有证据的自报反馈或独立审核| F
 ```
 
 `task_id=0` 的查询只能读取通用经验；项目专属经验需要来源任务或同公司任务上下文。没有公司归属的项目经验只在来源任务可用，不能据此声称已有跨任务复用。通用经验只保存脱敏的方法，不能保存历史 Cookie、Authorization、口令或其他可直接复用的会话材料。
@@ -60,7 +64,7 @@ python3 /home/maming/apps/artex-experience/review_entry.py EXPERIENCE_ID verifie
 
 ## 安装与检查
 
-将本目录中实现文件放到服务器 `/home/maming/apps/artex-experience`，仅允许服务账户访问。默认从 `/home/maming/apps/artex-1/config.json` 在进程内读取数据库连接，不显示配置和凭据。
+v5需要同时部署包含 `server/experience_runs.go`、`db/experience.go` 和经验角色工具边界的原生程序；仅替换Python文件无法启用宿主交付和原子采用。实现文件放到服务器 `/home/maming/apps/artex-experience`，仅允许服务账户访问。默认从 `/home/maming/apps/artex-1/config.json` 在进程内读取数据库连接，不显示配置和凭据。
 
 先检查清单：
 

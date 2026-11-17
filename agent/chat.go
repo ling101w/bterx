@@ -121,13 +121,13 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// visible skills/MCP and lets the DB tools table filter/override. DefaultTools
 	// have no tools-table rows, so they always pass through.
 	base := actool.DefaultTools()
-	if agentKey == ChainReviewerKey {
+	if agentKey == ChainReviewerKey || experienceAgent(agentKey) {
 		base = nil
 		ws.Enabled = false
 	}
 	ctx = WithRunInfo(ctx, RunInfo{SessionID: sessionID})
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
-	tools = chainReviewTools(agentKey, tools)
+	tools = experienceTools(agentKey, chainReviewTools(agentKey, tools))
 	defer cleanup()
 
 	system, boundary := deferredSystem(chatSystem(agentKey, c.workDir, sessionWorkDir), def)
@@ -143,7 +143,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
-		EnableWebFetch:  agentKey != ChainReviewerKey, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
+		EnableWebFetch:  agentKey != ChainReviewerKey && !experienceAgent(agentKey), // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
 		WebFetchProxy:   proxyAddr,
 		WebFetchCACert:  c.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
@@ -174,7 +174,13 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		opts.ToolOutputDir = ""
 		opts.MaxToolOutputChars = 32000
 	}
-	if c.guard != nil && agentKey != ChainReviewerKey {
+	if experienceAgent(agentKey) {
+		opts.DisableBackgroundTasks = true
+		opts.Hooks = experienceHooks(agentKey)
+		opts.ToolOutputDir = ""
+		opts.MaxToolOutputChars = 32000
+	}
+	if c.guard != nil && agentKey != ChainReviewerKey && !experienceAgent(agentKey) {
 		opts.Hooks = c.guard.Hooks()
 	}
 	if c.tx != nil { // persist raw human↔AI conversation; one accumulating file per thread

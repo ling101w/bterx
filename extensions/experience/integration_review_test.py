@@ -52,6 +52,8 @@ class ReviewRegressionTests(unittest.TestCase):
           INSERT INTO {s}.exploration_nodes VALUES
             (201,11,'finding','worker','done','{{}}',now()),
             (401,44,'fact','worker','done','{{"summary":"Synthetic initial method and observed result."}}',now());
+          UPDATE {s}.tasks SET updated_at=now()-interval '30 minutes',completed_at=now()-interval '30 minutes' WHERE id=4;
+          UPDATE {s}.exploration_nodes SET updated_at=now()-interval '30 minutes' WHERE id=401;
           COMMIT;""")
         self.rt = Runtime(self.db)
 
@@ -123,6 +125,8 @@ class ReviewRegressionTests(unittest.TestCase):
                         ",updated_at=now() WHERE id=401")
         self.assertEqual(self.db.query("SELECT updated_at FROM tasks WHERE id=4")[0]["updated_at"],
                          original_task_stamp)
+        self.assertEqual(self.rt.snapshot({"source_task_id": 4})["sources"], [])
+        self.db.execute("UPDATE exploration_nodes SET updated_at=now()-interval '30 minutes' WHERE id=401")
         second = self.source(task_id=4)
         self.assertNotEqual(first["revision"], second["revision"])
         self.assertIn("corrected", second["evidence"][0]["text"])
@@ -187,9 +191,9 @@ class ReviewRegressionTests(unittest.TestCase):
     def test_explicit_task_and_finding_exclusions_prevent_self_test_pollution(self):
         # Both a task retrospective and a finding were already collected and
         # published before the operator recognized the task as a self-test.
-        self.db.execute("""UPDATE tasks SET status='done',completed_at=now() WHERE id=1;
+        self.db.execute("""UPDATE tasks SET status='done',completed_at=now()-interval '30 minutes',updated_at=now()-interval '30 minutes' WHERE id=1;
           INSERT INTO exploration_nodes VALUES
-            (205,11,'fact','worker','confirmed','{"summary":"Synthetic acceptance-only observation"}',now());
+            (205,11,'fact','worker','confirmed','{"summary":"Synthetic acceptance-only observation"}',now()-interval '30 minutes');
           INSERT INTO findings VALUES
             (102,2,0,'auth','Synthetic unaffected finding','Synthetic independent source',
              'Controlled independent evidence belongs to an unaffected task.',
@@ -220,6 +224,70 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(self.db.query(f"SELECT status FROM {self.s}.entries WHERE id={literal(unaffected_id)}")[0]["status"],
                          "deprecated")
         self.assertEqual(self.rt._finding_candidates(10, 2), [])
+
+
+    def test_running_task_with_an_old_met_goal_is_not_repeatedly_curated(self):
+        self.db.execute("UPDATE tasks SET status='running' WHERE id=4")
+        self.db.execute("INSERT INTO exploration_nodes VALUES(402,44,'goal','planner','met','{}',now()-interval '30 minutes')")
+        self.assertEqual(self.rt.snapshot({"source_task_id": 4})["sources"], [])
+
+    def test_unrelated_new_facts_do_not_erase_a_negative_method_but_correction_does(self):
+        first = self.source(task_id=4)
+        item = self.item(first, title="Synthetic negative boundary")
+        item["outcome"] = "negative"
+        negative_id = self.rt.publish({"entries": [item]})["saved"][0]["id"]
+        for node_id in range(402, 408):
+            self.db.execute("INSERT INTO exploration_nodes VALUES(" + str(node_id) +
+                ",44,'fact','worker','done'," + literal({"summary": "Unrelated observation " + str(node_id)}) +
+                ",now()-interval '30 minutes')")
+        self.assertEqual(self.rt.get({"id": negative_id, "task_id": 4})["experience"]["outcome"], "negative")
+        later = self.source(task_id=4)
+        later_id = self.rt.publish({"entries": [self.item(later, title="Synthetic different method")]})["saved"][0]["id"]
+        self.assertEqual(self.rt.get({"id": negative_id, "task_id": 4})["experience"]["status"], "candidate")
+        self.db.execute("UPDATE exploration_nodes SET payload=" + literal({"summary": "Original negative evidence was corrected."}) + " WHERE id=401")
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            self.rt.get({"id": negative_id, "task_id": 4})
+        self.assertEqual(self.rt.get({"id": later_id, "task_id": 4})["experience"]["status"], "candidate")
+
+    def test_task_snapshot_cannot_publish_after_a_cited_fact_changes(self):
+        source = self.source(task_id=4)
+        self.db.execute("UPDATE exploration_nodes SET payload=" + literal({"summary": "Corrected after snapshot."}) + " WHERE id=401")
+        result = self.rt.publish({"entries": [self.item(source)]})
+        self.assertEqual(result["saved"], [])
+        self.assertIn("Cited task facts changed", result["rejected"][0]["error"])
+
+    def test_feedback_requires_fresh_results_from_the_actual_intent(self):
+        entry_id = self.rt.publish({"entries": [self.item(self.source())]})["saved"][0]["id"]
+        self.rt.search({"task_id": 2, "query": "authorization"})
+        self.db.execute("""INSERT INTO exploration_nodes VALUES
+          (501,22,'intent','planner','done','{}',now()),
+          (502,22,'work','worker','done','{}',now()),
+          (503,22,'fact','worker','done','{}',now()),
+          (504,22,'fact','worker','done','{}',now()),
+          (505,22,'fact','worker','done','{}',now()-interval '1 day')""")
+        self.db.execute("INSERT INTO exploration_edges VALUES(22,501,502,'runs'),(22,502,503,'produces'),(22,502,505,'produces')")
+        payload = {"id": entry_id, "task_id": 2, "intent_id": 501, "event": "helpful", "note": "Synthetic observed result.", "evidence_node_ids": [503]}
+        for node_id in (201, 504, 505):
+            with self.subTest(node_id=node_id), self.assertRaisesRegex(ValueError, "Feedback evidence"):
+                self.rt.feedback(dict(payload, evidence_node_ids=[node_id]))
+        self.assertTrue(self.rt.feedback(payload)["evidence_linked"])
+        record = self.db.query(f"SELECT evidence_node_ids FROM {self.s}.usage WHERE event='helpful'")[0]
+        self.assertEqual(record["evidence_node_ids"], [503])
+        self.assertEqual(self.rt.get({"id": entry_id, "task_id": 2})["experience"]["status"], "candidate")
+
+    def test_activity_feedback_rejects_errors_as_positive_evidence(self):
+        entry_id = self.rt.publish({"entries": [self.item(self.source())]})["saved"][0]["id"]
+        self.rt.search({"task_id": 2, "query": "authorization"})
+        self.raw.execute(f"ALTER TABLE {self.s}.activity ADD COLUMN created_at timestamptz DEFAULT now()")
+        self.db.execute("INSERT INTO exploration_nodes VALUES(701,22,'intent','planner','done','{}',now()),(702,22,'work','worker','done','{}',now())")
+        self.db.execute("INSERT INTO exploration_edges VALUES(22,701,702,'runs')")
+        self.db.execute("""INSERT INTO activity VALUES
+          (711,22,702,'tool_result','fixture','Observed','Synthetic independent result',false,now()),
+          (712,22,702,'tool_result','fixture','Error','Synthetic transport error',true,now())""")
+        payload = {"id": entry_id, "task_id": 2, "intent_id": 701, "event": "helpful", "note": "Synthetic current observation."}
+        with self.assertRaisesRegex(ValueError, "Feedback evidence"):
+            self.rt.feedback(dict(payload, evidence_activity_ids=[712]))
+        self.assertTrue(self.rt.feedback(dict(payload, evidence_activity_ids=[711]))["evidence_linked"])
 
 
 if __name__ == "__main__":

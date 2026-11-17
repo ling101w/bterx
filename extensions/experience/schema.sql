@@ -2,6 +2,32 @@
 -- Preserve the quoted schema token for Database.migrate's safe substitution.
 CREATE SCHEMA IF NOT EXISTS "artex_experience";
 
+CREATE TABLE IF NOT EXISTS "artex_experience".curation_runs (
+    id TEXT PRIMARY KEY, conversation_id BIGINT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('prepared','running','no_source','saved','partial','skipped','failed','cancelled')),
+    snapshots JSONB NOT NULL DEFAULT '{}', saved_entry_ids JSONB NOT NULL DEFAULT '[]',
+    rejected_items JSONB NOT NULL DEFAULT '[]', skipped_items JSONB NOT NULL DEFAULT '[]',
+    attempt_count INTEGER NOT NULL DEFAULT 0, error_code TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ,
+    lease_until TIMESTAMPTZ NOT NULL DEFAULT now()+interval '8 minutes'
+);
+CREATE INDEX IF NOT EXISTS experience_curation_conversation
+    ON "artex_experience".curation_runs(conversation_id,started_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS experience_curation_active_conversation
+    ON "artex_experience".curation_runs(conversation_id) WHERE status IN ('prepared','running');
+ALTER TABLE "artex_experience".curation_runs ADD COLUMN IF NOT EXISTS trigger_type TEXT NOT NULL DEFAULT 'manual';
+
+CREATE TABLE IF NOT EXISTS "artex_experience".intent_experiences (
+    exploration_id BIGINT NOT NULL, task_id BIGINT NOT NULL, intent_id BIGINT NOT NULL,
+    experience_id TEXT NOT NULL, experience_revision TEXT NOT NULL, method_snapshot JSONB NOT NULL,
+    adopted_at TIMESTAMPTZ NOT NULL DEFAULT now(), result_state TEXT NOT NULL DEFAULT 'pending_execution',
+    terminal_state TEXT NOT NULL DEFAULT '', evidence_node_ids JSONB NOT NULL DEFAULT '[]',
+    evidence_activity_ids JSONB NOT NULL DEFAULT '[]', feedback_state TEXT NOT NULL DEFAULT 'awaiting_execution',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(intent_id,experience_id)
+);
+CREATE INDEX IF NOT EXISTS experience_intent_results
+    ON "artex_experience".intent_experiences(task_id,result_state,feedback_state);
+
 -- Operator-managed exclusions keep validation/self-test sources out of the
 -- learning set. No task/finding foreign key: exclusion survives source cleanup.
 CREATE TABLE IF NOT EXISTS "artex_experience".source_exclusions (
@@ -23,6 +49,8 @@ CREATE TABLE IF NOT EXISTS "artex_experience".sources (
     published_at TIMESTAMPTZ,
     lease_until TIMESTAMPTZ
 );
+ALTER TABLE "artex_experience".sources
+    ADD COLUMN IF NOT EXISTS published_extractor_version TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS "artex_experience".entries (
     id TEXT PRIMARY KEY,
@@ -115,3 +143,14 @@ CREATE TABLE IF NOT EXISTS "artex_experience".reviews (
 );
 CREATE INDEX IF NOT EXISTS experience_reviews_entry
     ON "artex_experience".reviews(experience_id,id DESC);
+
+-- Retain a method while its cited facts remain unchanged. Additional facts in
+-- the source task do not invalidate an unrelated, already extracted method.
+ALTER TABLE "artex_experience".entries
+    ADD COLUMN IF NOT EXISTS dependency_revisions JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE "artex_experience".entries
+    ADD COLUMN IF NOT EXISTS method_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE "artex_experience".usage
+    ADD COLUMN IF NOT EXISTS evidence_node_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE "artex_experience".usage
+    ADD COLUMN IF NOT EXISTS evidence_activity_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
