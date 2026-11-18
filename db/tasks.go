@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -728,14 +729,28 @@ func (d *DB) DeleteTaskCascadePrepared(
 	deleteAssets, deleteFindings, deleteLLMRecords bool,
 	prepare func(TaskDeletePreparation) error,
 ) (TaskDeleteResult, error) {
+	return d.DeleteTaskCascadePreparedContext(context.Background(), id, deleteAssets, deleteFindings, deleteLLMRecords, prepare)
+}
+
+// Every SQL statement, including lock acquisition and cascading deletes, obeys
+// the caller's deadline. External preparation must use the same context.
+func (d *DB) DeleteTaskCascadePreparedContext(
+	ctx context.Context,
+	id int64,
+	deleteAssets, deleteFindings, deleteLLMRecords bool,
+	prepare func(TaskDeletePreparation) error,
+) (TaskDeleteResult, error) {
 	var result TaskDeleteResult
-	tx, err := d.Begin()
+	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return result, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout='5s'`); err != nil {
+		return result, err
+	}
 	var expID int64
-	if err := tx.QueryRow(`SELECT exploration_id FROM tasks WHERE id=$1 FOR UPDATE`, id).Scan(&expID); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT exploration_id FROM tasks WHERE id=$1 FOR UPDATE`, id).Scan(&expID); err != nil {
 		if err == sql.ErrNoRows {
 			return result, nil // already gone
 		}
@@ -747,12 +762,12 @@ func (d *DB) DeleteTaskCascadePrepared(
 	// prevents phantoms (a distinct asset row for the same host) as well as new
 	// ownership/anchor references until the deletion transaction commits.
 	if deleteAssets || prepare != nil {
-		if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		if _, err := tx.ExecContext(ctx, `LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 			return result, err
 		}
 	}
 	if prepare != nil {
-		hosts, err := hostsForTaskDeletion(tx, id, expID)
+		hosts, err := hostsForTaskDeletionContext(ctx, tx, id, expID)
 		if err != nil {
 			return result, err
 		}
@@ -768,7 +783,7 @@ func (d *DB) DeleteTaskCascadePrepared(
 		// An asset is deletable only when no other live task references it through
 		// either mechanism. This covers legacy anchor-only seeds without destroying
 		// evidence anchored by another task.
-		res, err := tx.Exec(`
+		res, err := tx.ExecContext(ctx, `
 WITH candidate_assets AS (
   SELECT id FROM assets WHERE $1 = ANY(task_ids)
   UNION
@@ -798,21 +813,21 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 		}
 		result.AssetsDeleted, _ = res.RowsAffected()
 
-		res, err = tx.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, id)
+		res, err = tx.ExecContext(ctx, `UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, id)
 		if err != nil {
 			return result, err
 		}
 		result.AssetsDetached, _ = res.RowsAffected()
 	}
 	if deleteFindings {
-		res, err := tx.Exec(`DELETE FROM findings WHERE task_id = $1`, id)
+		res, err := tx.ExecContext(ctx, `DELETE FROM findings WHERE task_id = $1`, id)
 		if err != nil {
 			return result, err
 		}
 		result.FindingsDeleted, _ = res.RowsAffected()
 	}
 	if deleteLLMRecords {
-		res, err := tx.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(id, 10))
+		res, err := tx.ExecContext(ctx, `DELETE FROM llm_records WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(id, 10))
 		if err != nil {
 			return result, err
 		}
@@ -820,10 +835,10 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 	}
 	// llm_usage (the token metering ledger) is intentionally NOT deleted with the
 	// task — it is kept as historical accounting even after the task is gone.
-	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE id=$1`, id); err != nil {
 		return result, err
 	}
-	if _, err := tx.Exec(`DELETE FROM explorations WHERE id=$1`, expID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM explorations WHERE id=$1`, expID); err != nil {
 		return result, err
 	}
 	return result, tx.Commit()

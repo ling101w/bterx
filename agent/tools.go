@@ -1035,6 +1035,13 @@ type intentItem struct {
 // 节点（不能挂在别的意图/目标/提示上）。顶层全新方向留空 parent_ids，兜底连 origin fact。
 // 这样"每个意图都连到 fact 节点、且是发现驱动而非凭空规划"从创建路径上被强制。
 func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
+	return t.addOneIntentContext(context.Background(), it)
+}
+
+func (t *ToolSet) addOneIntentContext(ctx context.Context, it intentItem) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
@@ -1091,33 +1098,16 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
-	if len(it.ExperienceRefs) > 0 {
-		payload["experience_refs"] = it.ExperienceRefs
-		if len(parents) == 0 {
-			if origin, _ := t.ts.OriginFactID(); origin > 0 {
-				parents = []int64{origin}
-			}
-		}
-		return t.ts.AddIntentWithExperiences(payload, priority, anchors, parents, it.ExperienceRefs)
-	}
-	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
-	if err != nil {
-		return 0, err
-	}
-	// upstream lineage: link each (validated) fact/finding parent → this intent, so
-	// "multiple facts combine into one new intent" is expressible.
-	for _, parent := range parents {
-		_ = t.ts.Link(parent, db.RelDerivedFrom, id)
-	}
-	// a top-level intent (no explicit parent) connects to the origin fact, so every
-	// intent still traces back to a fact node — at task start the only fact is the
-	// origin, and the first intents derive from it.
 	if len(parents) == 0 {
 		if origin, _ := t.ts.OriginFactID(); origin > 0 {
-			_ = t.ts.Link(origin, db.RelDerivedFrom, id)
+			parents = []int64{origin}
 		}
 	}
-	return id, nil
+	if len(it.ExperienceRefs) > 0 {
+		payload["experience_refs"] = it.ExperienceRefs
+		return t.ts.AddIntentWithExperiencesContext(ctx, payload, priority, anchors, parents, it.ExperienceRefs)
+	}
+	return t.ts.AddIntentWithParentsContext(ctx, payload, priority, anchors, parents, "planner")
 }
 
 func (t *ToolSet) addIntent() actool.CoreTool {
@@ -1131,7 +1121,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			"experience_refs": map[string]any{"type": "array", "maxItems": 3, "description": "可选：实际采用的历史方法及刚读取的revision；不是当前事实或授权。程序自动登记adopted。", "items": obj(map[string]any{"id": str("真实经验编号"), "revision": str("search/get返回的revision")}, "id", "revision")},
 			"priority":        intp("优先级 0-10，默认5"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Intents    []intentItem `json:"intents"`
 				intentItem              // 单条模式：顶层 summary/asset_ids/parent_ids/priority
@@ -1147,7 +1137,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			errs := map[string]string{}
 			createdAny := false
 			for i, it := range items {
-				id, err := t.addOneIntent(it)
+				id, err := t.addOneIntentContext(ctx, it)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue

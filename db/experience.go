@@ -112,10 +112,14 @@ func ValidateExperienceRefs(refs []ExperienceRef) error {
 // This is an adoption link, not a fact or an authorization source. Intent,
 // anchors, lineage, frozen method and adopted event commit together.
 func (s *ExplorationStore) AddIntentWithExperiences(payload map[string]any, priority int, anchors, parents []int64, refs []ExperienceRef) (int64, error) {
+	return s.AddIntentWithExperiencesContext(context.Background(), payload, priority, anchors, parents, refs)
+}
+
+func (s *ExplorationStore) AddIntentWithExperiencesContext(ctx context.Context, payload map[string]any, priority int, anchors, parents []int64, refs []ExperienceRef) (int64, error) {
 	if err := ValidateExperienceRefs(refs); err != nil {
 		return 0, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -123,14 +127,14 @@ func (s *ExplorationStore) AddIntentWithExperiences(payload map[string]any, prio
 	}
 	defer tx.Rollback()
 	var taskID int64
-	if err = tx.QueryRow(`SELECT id FROM tasks WHERE exploration_id=$1 AND deleted_at IS NULL`, s.expID).Scan(&taskID); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT id FROM tasks WHERE exploration_id=$1 AND deleted_at IS NULL`, s.expID).Scan(&taskID); err != nil {
 		return 0, fmt.Errorf("经验采用需要有效任务上下文")
 	}
 	methods := make([]json.RawMessage, len(refs))
 	for i, ref := range refs {
 		var revision, status string
 		var method []byte
-		err = tx.QueryRow(`SELECT e.source_revision||':'||e.extractor_version,e.status,
+		err = tx.QueryRowContext(ctx, `SELECT e.source_revision||':'||e.extractor_version,e.status,
           jsonb_build_object('id',e.id,'title',e.title,'category',e.category,'status',e.status,
             'revision',e.source_revision||':'||e.extractor_version,'applicable_when',e.applicable_when,
             'not_applicable',e.not_applicable,'success_criteria',e.success_criteria,'steps',e.steps,
@@ -149,7 +153,7 @@ func (s *ExplorationStore) AddIntentWithExperiences(payload map[string]any, prio
 			return 0, fmt.Errorf("经验%s版本已改变，请重新读取", ref.ID)
 		}
 		var excluded bool
-		if err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM artex_experience.entries e JOIN artex_experience.source_exclusions x
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM artex_experience.entries e JOIN artex_experience.source_exclusions x
           ON x.source_key=e.source_key OR x.source_key='task:'||e.source_task_id::text WHERE e.id=$1)`, ref.ID).Scan(&excluded); err != nil {
 			return 0, err
 		}
@@ -163,26 +167,26 @@ func (s *ExplorationStore) AddIntentWithExperiences(payload map[string]any, prio
 	}
 	var id int64
 	raw, _ := json.Marshal(payload)
-	if err = tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
+	if err = tx.QueryRowContext(ctx, `INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
       VALUES($1,'intent',$2,$3,'open','planner') RETURNING id`, s.expID, string(raw), priority).Scan(&id); err != nil {
 		return 0, err
 	}
 	for _, a := range anchors {
-		if _, err = tx.Exec(`INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
 			return 0, err
 		}
 	}
 	for _, parent := range parents {
-		if _, err = tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id) VALUES($1,$2,'derived_from',$3) ON CONFLICT DO NOTHING`, s.expID, parent, id); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id) VALUES($1,$2,'derived_from',$3) ON CONFLICT DO NOTHING`, s.expID, parent, id); err != nil {
 			return 0, err
 		}
 	}
 	for i, ref := range refs {
-		if _, err = tx.Exec(`INSERT INTO artex_experience.intent_experiences(exploration_id,task_id,intent_id,experience_id,experience_revision,method_snapshot)
+		if _, err = tx.ExecContext(ctx, `INSERT INTO artex_experience.intent_experiences(exploration_id,task_id,intent_id,experience_id,experience_revision,method_snapshot)
           VALUES($1,$2,$3,$4,$5,$6)`, s.expID, taskID, id, ref.ID, ref.Revision, string(methods[i])); err != nil {
 			return 0, err
 		}
-		if _, err = tx.Exec(`INSERT INTO artex_experience.usage(experience_id,task_id,intent_id,event,note,run_key)
+		if _, err = tx.ExecContext(ctx, `INSERT INTO artex_experience.usage(experience_id,task_id,intent_id,event,note,run_key)
           VALUES($1,$2,$3,'adopted','Structured adoption at intent creation',$4) ON CONFLICT DO NOTHING`, ref.ID, taskID, id, fmt.Sprintf("intent:%d", id)); err != nil {
 			return 0, err
 		}

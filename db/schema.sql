@@ -320,6 +320,9 @@ ALTER TABLE activity ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{
 -- original session). Only worker='mainagent' rows carry it.
 ALTER TABLE activity ADD COLUMN IF NOT EXISTS main_seg INTEGER;
 CREATE INDEX IF NOT EXISTS idx_act_node  ON activity(exploration_id, node_id, id);
+-- Cascading deletion checks node_id without exploration_id. A leading-node
+-- index avoids rescanning the full activity index for every deleted node.
+CREATE INDEX IF NOT EXISTS idx_act_node_ref ON activity(node_id) WHERE node_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_act_since ON activity(exploration_id, id);
 CREATE INDEX IF NOT EXISTS idx_act_tool_call ON activity(exploration_id, tool_use_id, id)
   WHERE kind IN ('tool_use', 'tool_result');
@@ -1175,6 +1178,7 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_findings_node_ref ON findings(node_id) WHERE node_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);
 -- 「按资产」视图靠 asset_ids @> '[<id>]' 反查发现,没有这个 GIN 索引就是全表扫。
@@ -1634,6 +1638,7 @@ CREATE TABLE IF NOT EXISTS task_intelligence (
     UNIQUE(task_id,kind,fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_task_intelligence_task ON task_intelligence(task_id,id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_intelligence_node_ref ON task_intelligence(node_id) WHERE node_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_task_intelligence_assets ON task_intelligence USING gin(asset_ids);
 
 -- Optional derived credential presentation; raw intelligence remains authoritative.

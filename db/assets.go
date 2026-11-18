@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -1283,7 +1284,17 @@ type rowsQuerier interface {
 // transaction path so asset/anchor writes stay locked until the task delete is
 // committed.
 func hostsForTaskDeletion(q rowsQuerier, taskID, explorationID int64) ([]string, error) {
-	rows, err := q.Query(`
+	return hostsForTaskDeletionQuery(func(query string, args ...any) (*sql.Rows, error) { return q.Query(query, args...) }, taskID, explorationID)
+}
+
+func hostsForTaskDeletionContext(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, taskID, explorationID int64) ([]string, error) {
+	return hostsForTaskDeletionQuery(func(query string, args ...any) (*sql.Rows, error) { return q.QueryContext(ctx, query, args...) }, taskID, explorationID)
+}
+
+func hostsForTaskDeletionQuery(query func(string, ...any) (*sql.Rows, error), taskID, explorationID int64) ([]string, error) {
+	rows, err := query(`
 WITH current_assets AS (
   SELECT id FROM assets WHERE $1 = ANY(task_ids)
   UNION

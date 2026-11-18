@@ -2015,7 +2015,18 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 // staged while PostgreSQL excludes asset/anchor writers. Both are restored on a
 // database failure and purged only after its commit.
 func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResult, error) {
+	return m.DeleteTaskContext(context.Background(), id, opts)
+}
+
+// A large optional traffic purge must not hold the global asset/anchor locks
+// for hours. Cancellation returns through the existing external rollback path.
+func (m *Manager) DeleteTaskContext(ctx context.Context, id string, opts DeleteTaskOptions) (DeleteTaskResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
 	result := DeleteTaskResult{Deleted: id}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
 		return result, err
@@ -2045,7 +2056,7 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 			if len(p.TrafficHosts) == 0 {
 				return nil
 			}
-			trafficStage, err = m.traffic.StageDeleteHostsExact(p.TrafficHosts)
+			trafficStage, err = m.traffic.StageDeleteHostsExactContext(ctx, p.TrafficHosts)
 			if err != nil {
 				return err
 			}
@@ -2054,10 +2065,13 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 		}
 	}
 
-	dbResult, err := m.pg.DeleteTaskCascadePrepared(
-		n, opts.DeleteAssets, opts.DeleteFindings, opts.DeleteLLMRecords, prepare,
+	dbResult, err := m.pg.DeleteTaskCascadePreparedContext(
+		ctx, n, opts.DeleteAssets, opts.DeleteFindings, opts.DeleteLLMRecords, prepare,
 	)
 	if err != nil {
+		if ctx.Err() != nil {
+			err = fmt.Errorf("任务清理已取消或超过60秒；停止继续删除: %w", ctx.Err())
+		}
 		return result, rollbackTaskDelete(err, trafficStage, fileStage)
 	}
 	result.AssetsDeleted = dbResult.AssetsDeleted

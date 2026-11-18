@@ -1272,19 +1272,23 @@ func (t *Traffic) compactIndex() error {
 // full-text index rows, bodies, blob references, and finally the index rows.
 // Order matters — each sub-select reads exchanges, so that table is emptied last.
 func (t *Traffic) deleteWhere(tx *sql.Tx, where string, args ...any) (int64, error) {
+	return t.deleteWhereContext(context.Background(), tx, where, args...)
+}
+
+func (t *Traffic) deleteWhereContext(ctx context.Context, tx *sql.Tx, where string, args ...any) (int64, error) {
 	if t.fts {
 		// ex_fts is contentless and addressed by rowid, hence the rowid sub-select.
-		if _, err := tx.Exec(`DELETE FROM ex_fts WHERE rowid IN (SELECT rowid FROM exchanges WHERE `+where+`)`, args...); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM ex_fts WHERE rowid IN (SELECT rowid FROM exchanges WHERE `+where+`)`, args...); err != nil {
 			return 0, fmt.Errorf("删除全文索引: %w", err)
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM exchange_bodies WHERE id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM exchange_bodies WHERE id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
 		return 0, fmt.Errorf("删除正文: %w", err)
 	}
-	if _, err := tx.Exec(`DELETE FROM blob_refs WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM blob_refs WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
 		return 0, fmt.Errorf("删除 blob 引用: %w", err)
 	}
-	res, err := tx.Exec(`DELETE FROM exchanges WHERE `+where, args...)
+	res, err := tx.ExecContext(ctx, `DELETE FROM exchanges WHERE `+where, args...)
 	if err != nil {
 		return 0, fmt.Errorf("删除索引行: %w", err)
 	}
@@ -1503,6 +1507,10 @@ func (t *Traffic) StageDeleteHostsExact(hosts []string) (*HostDeleteStage, error
 	return t.stageDeleteHostsExact(hosts, 0, 0)
 }
 
+func (t *Traffic) StageDeleteHostsExactContext(ctx context.Context, hosts []string) (*HostDeleteStage, error) {
+	return t.stageDeleteHostsExactContext(ctx, hosts, 0, 0)
+}
+
 // StageDeleteHostsExactForArchive ties the reversible traffic deletion to a
 // persistent task archive. Startup recovery uses archiveCommitted to decide
 // whether an interrupted stage must be completed or rolled back.
@@ -1514,7 +1522,13 @@ func (t *Traffic) StageDeleteHostsExactForArchive(hosts []string, archiveID, tas
 }
 
 func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64) (*HostDeleteStage, error) {
-	t.wmu.Lock()
+	return t.stageDeleteHostsExactContext(context.Background(), hosts, archiveID, taskID)
+}
+
+func (t *Traffic) stageDeleteHostsExactContext(ctx context.Context, hosts []string, archiveID, taskID int64) (*HostDeleteStage, error) {
+	if err := t.lockWriteContext(ctx); err != nil {
+		return nil, err
+	}
 	stage := &HostDeleteStage{traffic: t}
 	fail := func(cause error) (*HostDeleteStage, error) {
 		if rollbackErr := stage.rollbackLocked(); rollbackErr != nil {
@@ -1546,13 +1560,16 @@ func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64)
 		legacy = append(legacy, filepath.Join(t.dir, sanitize(h)))
 	}
 
+	// The reversible SQLite stage stays live through the PostgreSQL commit.
+	// Cancel its statements explicitly; binding the transaction lifetime to ctx
+	// could auto-rollback it in the gap after PostgreSQL has already committed.
 	tx, err := t.db.Begin()
 	if err != nil {
 		return abort(err)
 	}
 	stage.tx = tx
 	for _, h := range unique {
-		n, err := t.deleteWhere(tx, `host=?`, h)
+		n, err := t.deleteWhereContext(ctx, tx, `host=?`, h)
 		if err != nil {
 			return fail(err)
 		}
@@ -1563,7 +1580,30 @@ func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64)
 	if err != nil {
 		return fail(err)
 	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
 	return stage, nil
+}
+
+func (t *Traffic) lockWriteContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for !t.wmu.TryLock() {
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		t.wmu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // RecoverHostDeleteStages resolves filesystem moves left by a process exit.

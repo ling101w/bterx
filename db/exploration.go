@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -195,25 +196,53 @@ func (s *ExplorationStore) Root() (description, goal string, err error) {
 
 // AddNode writes a typed reasoning node with optional anchors to asset ids.
 func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
+	return s.AddNodeContext(context.Background(), kind, payload, priority, state, origin, anchors)
+}
+
+func (s *ExplorationStore) AddNodeContext(ctx context.Context, kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
+	return s.addNodeContext(ctx, kind, payload, priority, state, origin, anchors, nil)
+}
+
+// The node, anchors and parent edges share the caller's cancellation and one
+// transaction. A timed-out tool must not create an intent hours after its retry.
+func (s *ExplorationStore) addNodeContext(ctx context.Context, kind string, payload map[string]any, priority int, state, origin string, anchors, parents []int64) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	raw, _ := json.Marshal(payload)
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout='5s'`); err != nil {
+		return 0, err
+	}
 	var id int64
-	if err := tx.QueryRow(`
+	if err := tx.QueryRowContext(ctx, `
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 		s.expID, kind, string(raw), priority, state, origin).Scan(&id); err != nil {
 		return 0, err
 	}
 	for _, a := range anchors {
-		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
+			return 0, err
+		}
+	}
+	for _, parent := range parents {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
+VALUES($1,$2,'derived_from',$3) ON CONFLICT DO NOTHING`, s.expID, parent, id); err != nil {
 			return 0, err
 		}
 	}
 	return id, tx.Commit()
+}
+
+func (s *ExplorationStore) AddIntentWithParentsContext(ctx context.Context, payload map[string]any, priority int, anchors, parents []int64, origin string) (int64, error) {
+	if origin == "" {
+		origin = "planner"
+	}
+	return s.addNodeContext(ctx, "intent", payload, priority, "open", origin, anchors, parents)
 }
 
 // AddIntent is a convenience: an open intent.
