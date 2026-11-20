@@ -419,6 +419,8 @@ export const api = {
       active_llm_profile_id: activeLLMProfileId ?? null,
     }),
   deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
+  taskCleanups: () => get<{jobs: import("./types").TaskCleanupJob[]}>("/task-cleanups"),
+  retryTaskCleanup: (id: number) => post<{ok: boolean}>(`/task-cleanups/${id}/retry`, {}),
   controlTask: (id: string, action: "pause" | "resume") =>
     post<{ id: string; paused: boolean; queued: boolean; status: string }>(`/tasks/${id}/control`, { action }),
   controlTasksBatch: (taskIds: string[], action: "pause" | "resume") =>

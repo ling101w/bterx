@@ -174,20 +174,8 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
-	result, err := s.m.DeleteTaskContext(r.Context(), id, opts)
+	job, err := s.queueTaskCleanup(r.Context(), id, opts)
 	if err != nil {
-		var committed *taskDeleteCommittedError
-		if errors.As(err, &committed) {
-			// PostgreSQL is already gone. Complete runtime teardown and return the
-			// auditable counts together with the post-commit cleanup warning.
-			s.engine.StopTask(id)
-			s.taskAgentMu.Lock()
-			delete(s.taskAgents, id)
-			s.taskAgentMu.Unlock()
-			deleted = true
-			writeCommittedTaskDelete(w, result, err)
-			return
-		}
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -199,7 +187,12 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	delete(s.taskAgents, id)
 	s.taskAgentMu.Unlock()
 	deleted = true
-	writeJSON(w, 200, result)
+	result := DeleteTaskResult{Deleted: id}
+	if job != nil {
+		result.CleanupPending = job.State != "done"
+		result.CleanupJobID = job.ID
+	}
+	writeJSON(w, http.StatusAccepted, result)
 }
 
 func writeCommittedTaskDelete(w http.ResponseWriter, result DeleteTaskResult, err error) {

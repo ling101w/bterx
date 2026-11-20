@@ -2,7 +2,7 @@
 
 基于 [ARTEX](https://github.com/RuoJi6/ARTEX) 的授权安全测试 Agent 系统，保留 Go 后端、Next.js 前端和 PostgreSQL 探索图，并加入规划约束、异步链路复盘、报告链路经验整理及按需经验检索。
 
-当前版本为 `0.3.27-opt.4-runtime-fix`：在 v0.3.27 基础上加入经验交付/采用追踪，并修复删除长期持锁和意图取消后迟到落库。11月13日原始导入清单作为历史基线保留；当前代码继续维护。不包含生产数据库、任务报告、流量、模型密钥或已编译程序。上游代码及 AGPL-3.0 许可证保留；Go module路径保留原值。
+当前版本为 `0.3.27-opt.5-resumable-delete`：在 v0.3.27 基础上加入经验交付/采用追踪、可取消的意图写入，以及保留共享资料的后台分批删除。11月13日原始导入清单作为历史基线保留；当前代码继续维护。不包含生产数据库、任务报告、流量、模型密钥或已编译程序。上游代码及 AGPL-3.0 许可证保留；Go module路径保留原值。
 
 - [当前架构与 Agent 职责](docs/architecture.md)
 - [已部署优化、收益及限制](docs/optimizations.md)
@@ -12,6 +12,7 @@
 - [与上游 v0.3.30 的实际区别](docs/upstream-comparison-20261117.md)
 - [v5交付、验证与发布](docs/memory-v5.md)
 - [删除阻塞与迟到写入修复](docs/runtime-stall-fix-20261118.md)
+- [后台分批删除与共享资料保护](docs/resumable-delete-20261120.md)
 - [上游原始说明](README.upstream.md)
 
 ## 协作方式
@@ -55,7 +56,7 @@ cd ..
 mkdir -p server/webui/dist
 cp -a web/out/. server/webui/dist/
 CGO_ENABLED=0 go build -trimpath -tags embedui \
-  -ldflags='-s -w -X main.version=0.3.27-opt.4-runtime-fix' \
+  -ldflags='-s -w -X main.version=0.3.27-opt.5-resumable-delete' \
   -o artex ./cmd/artex
 cp config.example.json config.json
 # 在本地 config.json 配置数据库；模型和权限在自己的部署中配置。

@@ -762,7 +762,7 @@ func (d *DB) DeleteTaskCascadePreparedContext(
 	// prevents phantoms (a distinct asset row for the same host) as well as new
 	// ownership/anchor references until the deletion transaction commits.
 	if deleteAssets || prepare != nil {
-		if _, err := tx.ExecContext(ctx, `LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		if _, err := tx.ExecContext(ctx, `LOCK TABLE assets, exploration_anchors, task_asset_links IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 			return result, err
 		}
 	}
@@ -787,6 +787,8 @@ func (d *DB) DeleteTaskCascadePreparedContext(
 WITH candidate_assets AS (
   SELECT id FROM assets WHERE $1 = ANY(task_ids)
   UNION
+  SELECT asset_id FROM task_asset_links WHERE task_id=$1
+  UNION
   SELECT ea.asset_id
   FROM exploration_anchors ea
   JOIN exploration_nodes n ON n.id=ea.node_id
@@ -799,6 +801,9 @@ deletable AS (
   WHERE NOT EXISTS (
     SELECT 1 FROM tasks t
     WHERE t.id<>$1 AND t.deleted_at IS NULL AND t.id=ANY(a.task_ids)
+  ) AND NOT EXISTS (
+    SELECT 1 FROM task_asset_links link JOIN tasks t ON t.id=link.task_id
+    WHERE link.asset_id=a.id AND t.id<>$1 AND t.deleted_at IS NULL
   ) AND NOT EXISTS (
     SELECT 1
     FROM exploration_anchors ea

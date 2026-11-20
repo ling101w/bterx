@@ -1657,6 +1657,25 @@ CREATE TABLE IF NOT EXISTS "artex_experience".intent_experiences (
 CREATE INDEX IF NOT EXISTS experience_intent_results
     ON "artex_experience".intent_experiences(task_id,result_state,feedback_state);
 
+-- Permanent deletion is an irreversible, resumable sequence of short batches.
+-- No foreign keys here: the receipt must outlive the task and its exploration.
+CREATE TABLE IF NOT EXISTS task_cleanup_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    task_id BIGINT NOT NULL UNIQUE,
+    exploration_id BIGINT NOT NULL,
+    task_name TEXT NOT NULL DEFAULT '',
+    plan JSONB NOT NULL,
+    progress JSONB NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','failed','done')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_task_cleanup_due ON task_cleanup_jobs(next_attempt_at,id) WHERE state='pending';
+
 -- New optional property; preserve user descriptions and bindings.
 UPDATE tools SET schema=jsonb_set(schema,'{properties,experience_refs}',
  '{"type":"array","maxItems":3,"description":"实际采用的经验id和刚读取的revision；程序自动记adopted，不是当前事实或授权","items":{"type":"object","properties":{"id":{"type":"string"},"revision":{"type":"string"}},"required":["id","revision"]}}'::jsonb,true)

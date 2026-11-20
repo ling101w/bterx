@@ -253,6 +253,8 @@ type DeleteTaskResult struct {
 	FindingsDeleted   int64  `json:"findings_deleted"`
 	LLMRecordsDeleted int64  `json:"llm_records_deleted"`
 	CleanupWarning    string `json:"cleanup_warning,omitempty"`
+	CleanupPending    bool   `json:"cleanup_pending,omitempty"`
+	CleanupJobID      int64  `json:"cleanup_job_id,omitempty"`
 }
 
 // Manager owns the PostgreSQL data source (asset graph + every task's exploration

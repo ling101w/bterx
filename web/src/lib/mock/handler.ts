@@ -1222,6 +1222,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   }
 
   // ── tasks ──
+  if (path === "/task-cleanups" && m === "GET") return { jobs: [] };
   if (path === "/tasks" && m === "GET") {
     sortMockTasks();
     return { tasks: mockTasks.map(publicMockTask), active: mockActiveTask };

@@ -104,6 +104,22 @@ export interface DeleteTaskResult {
   findings_deleted: number;
   llm_records_deleted: number;
   cleanup_warning?: string;
+  cleanup_pending?: boolean;
+  cleanup_job_id?: number;
+}
+
+export interface TaskCleanupJob {
+  id: number;
+  task_id: number;
+  task_name: string;
+  state: "pending" | "failed" | "done";
+  last_error?: string;
+  progress: {
+    phase?: string;
+    activity_deleted?: number;
+    nodes_deleted?: number;
+    result?: DeleteTaskResult;
+  };
 }
 
 export type TaskArchiveState =

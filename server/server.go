@@ -128,6 +128,7 @@ type Server struct {
 	// channel coalesces enqueue bursts; the database remains the source of truth.
 	archiveWake       chan struct{}
 	archiveWG         sync.WaitGroup
+	cleanupWG         sync.WaitGroup
 	credentialWake    chan struct{}
 	proxyReconnect    proxyReconnectSupervisor
 	proxyPoolWake     chan struct{}
@@ -302,6 +303,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go func() { defer s.proxyPoolWG.Done(); s.runProxyPoolSupervisor(s.ctx) }()
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
+	s.startTaskCleanupWorker()
 	if m.pg != nil {
 		agent.CredentialRecorded = func() {
 			select {
@@ -320,6 +322,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 func (s *Server) Close() {
 	if s != nil {
 		s.proxyPoolWG.Wait()
+		s.cleanupWG.Wait()
 	}
 }
 
@@ -1025,6 +1028,8 @@ func (s *Server) Handler() http.Handler {
 
 	// --- 管理后台 API (PostgreSQL 数据源; 新版数据库与管理后台方案) ---
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.pgDeleteTask)
+	mux.HandleFunc("GET /api/task-cleanups", s.listTaskCleanups)
+	mux.HandleFunc("POST /api/task-cleanups/{id}/retry", s.retryTaskCleanup)
 	// Agents
 	// conversations (chat page)
 	mux.HandleFunc("GET /api/conversations", s.pgListConversations)

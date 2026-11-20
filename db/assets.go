@@ -1298,6 +1298,8 @@ func hostsForTaskDeletionQuery(query func(string, ...any) (*sql.Rows, error), ta
 WITH current_assets AS (
   SELECT id FROM assets WHERE $1 = ANY(task_ids)
   UNION
+  SELECT asset_id FROM task_asset_links WHERE task_id=$1
+  UNION
   SELECT ea.asset_id
   FROM exploration_anchors ea
   JOIN exploration_nodes n ON n.id=ea.node_id
@@ -1309,6 +1311,9 @@ other_assets AS (
   WHERE EXISTS (
     SELECT 1 FROM tasks t
     WHERE t.id<>$1 AND t.deleted_at IS NULL AND t.id=ANY(a.task_ids)
+  ) OR EXISTS (
+    SELECT 1 FROM task_asset_links link JOIN tasks t ON t.id=link.task_id
+    WHERE link.asset_id=a.id AND t.id<>$1 AND t.deleted_at IS NULL
   ) OR EXISTS (
     SELECT 1
     FROM exploration_anchors ea

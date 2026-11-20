@@ -276,6 +276,7 @@ function deleteDetails(result: DeleteCounts): string[] {
 }
 
 function deleteSummary(result: DeleteTaskResult): string {
+  if (result.cleanup_pending) return "任务已移出列表，后台正在分批清理，可在清理进度中查看";
   const details = deleteDetails(result);
   return details.length > 0
     ? `任务已删除（${details.join("，")}）`
@@ -856,10 +857,12 @@ export default function TasksPage() {
       const deleted: string[] = [];
       const failed: { id: string; message: string }[] = [];
       const warnings: string[] = [];
+      let pending = 0;
 
       for (const id of ids) {
         try {
           const r = await api.deleteTask(id, options);
+          if (r.cleanup_pending) pending++;
           total.assets_deleted += r.assets_deleted;
           total.assets_detached += r.assets_detached;
           total.traffic_deleted += r.traffic_deleted;
@@ -882,7 +885,7 @@ export default function TasksPage() {
         });
         const details = deleteDetails(total);
         const summary =
-          `已删除 ${deleted.length} 个任务` +
+          (pending > 0 ? `已移出 ${deleted.length} 个任务，${pending} 个正在后台清理` : `已删除 ${deleted.length} 个任务`) +
           (details.length > 0 ? `（${details.join("，")}）` : "");
         if (warnings.length > 0) {
           toast.warning(
@@ -1034,6 +1037,7 @@ export default function TasksPage() {
 
   return (
     <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-4">
+      <TaskCleanupStatus />
       <TabsList className="mx-4 lg:mx-6">
         <TabsTrigger value="current">当前任务</TabsTrigger>
         <TabsTrigger value="archived">已归档</TabsTrigger>
@@ -2341,6 +2345,33 @@ function ArchiveDeleteDialog({
   );
 }
 
+function TaskCleanupStatus() {
+  const [jobs, setJobs] = React.useState<import("@/lib/types").TaskCleanupJob[]>([]);
+  const [error, setError] = React.useState("");
+  const refresh = React.useCallback(async () => {
+    try { setJobs((await api.taskCleanups()).jobs); setError(""); }
+    catch { setError("清理进度读取失败，稍后自动重试"); }
+  }, []);
+  React.useEffect(() => {
+    void refresh();
+    const timer = setInterval(() => void refresh(), 3000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+  const phases: Record<string, string> = {traffic:"清理独有流量",blobs:"回收流量文件",assets:"清理独有资产",activity:"清理活动记录",findings:"清理独有报告",nodes:"清理探索节点",records:"清理模型记录",database:"完成数据库清理",files:"清理任务文件",done:"清理完成"};
+  if (!jobs.length && !error) return null;
+  return <div className="mx-4 rounded-lg border p-3 text-sm lg:mx-6" aria-live="polite">
+    <div className="mb-2 font-medium">清理进度</div>
+    {error && <p className="text-muted-foreground">{error}</p>}
+    {jobs.slice(0, 8).map(job => <div key={job.id} className="flex flex-wrap items-center gap-2 py-1">
+      <span>#{job.task_id} {job.task_name}</span>
+      <span className="text-muted-foreground">{job.state === "failed" ? "清理暂停，可重试" : job.state === "done" ? "清理完成" : phases[job.progress.phase || ""] || "等待清理"} · 活动 {job.progress.activity_deleted || 0} · 节点 {job.progress.nodes_deleted || 0}</span>
+      {job.state === "failed" && <Button size="sm" variant="outline" onClick={async () => {try {await api.retryTaskCleanup(job.id); await refresh();} catch(e) {toast.error((e as Error).message);}}}>重试</Button>}
+      {job.last_error && <span className="text-destructive">{job.last_error}</span>}
+      {job.progress.result?.cleanup_warning && <span className="text-muted-foreground">{job.progress.result.cleanup_warning}</span>}
+    </div>)}
+  </div>;
+}
+
 function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
   const [archives, setArchives] = React.useState<TaskArchive[]>([]);
   const [query, setQuery] = React.useState("");
@@ -2985,7 +3016,7 @@ function DeleteTaskDialog({
             ) : (
               "该任务"
             )}
-            的执行记录与探索链路将被永久删除。
+            的执行记录与探索链路将被永久删除。提交后会移出任务列表，后台分批清理，可在清理进度中查看；其他任务共用的资料会保留。
           </AlertDialogDescription>
         </AlertDialogHeader>
         <DeleteOptionFields
@@ -3149,7 +3180,7 @@ function BulkDeleteTasksDialog({
             确认删除所选 {ids.length} 个任务？
           </AlertDialogTitle>
           <AlertDialogDescription>
-            这些任务的执行记录与探索链路将被永久删除，下方清理选项对所选任务统一生效。
+            这些任务的执行记录与探索链路将被永久删除，下方清理选项对所选任务统一生效。后台会分批清理，其他任务共用的资料会保留。
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="text-muted-foreground flex flex-wrap gap-1 text-xs">
