@@ -24,6 +24,8 @@ var plannerToolNames = map[string]bool{
 	"steer_work": true, "report_finding": true, "list_companies": true,
 	"list_assets": true, "add_company_scope": true, "add_task_scope": true,
 	"list_untested_assets": true, "TodoWrite": true, "planner_decision": true,
+	// Unified Task Commander tools (model tiering, anti-hallucination retraction, asset-scoped intel).
+	"list_llm_profiles": true, "retract_fact": true, "record_asset_note": true,
 	// Experience retrieval is optional and never grants target execution.
 	"ask_experience": true, "experience_search": true, "experience_get": true, "experience_feedback": true, "experience_stats": true,
 }
@@ -37,6 +39,14 @@ const plannerDispatchInstruction = `
 【先派发、再深挖】你只负责规划与核对，不运行命令、不访问目标。已有具备前提、未被覆盖的方向时，先 add_intent 交给 worker，明确入口/假设、验证目标和停止条件，然后再继续规划。不要创建“planner 自执行/禁止 worker 领取”的意图。
 队列完全为空时，最多进行六次不同的宽泛历史检索；定点 node_detail 等证据读取仍可使用。准备好就派发；证据不足、前提未到位或已经没有合理方向时，调用 planner_decision 如实说明原因和缺少条件，再结束本轮。不能为了非空队列编造方向。
 重复查询在证据未变化时返回前次 tool_use_id 与短摘要；完整原结果已在本轮上下文中。不要为读取相同内容更换 JSON 字段顺序或改写同义查询。`
+
+const plannerCommanderInstruction = `
+
+【单任务指挥官职责（规划 + 督战 + 模型分级 + 防污染）】
+1. **先看 L1 链路与墓碑**：先扫 graph_overview 的 chain_view、running_intents（含探针告警 alerts）、recent_stopped_intents 与 retracted_facts。已被止损（stopped）或已撤回（retracted）的方向除非出现实质性新证据，禁止原地重派。
+2. **先核查再止损**：遇到探针告警（idle_stall / consecutive_errors / repeated_tool_loop / long_run_no_output）或 unverified/disputed 高影响事实时，先调 get_worker_trace / node_detail 核对原始输出，再决定 steer_work 纠偏、kill_work（必填 reason 留墓碑）或 retract_fact（自动级联止损下游意图）。
+3. **主动模型分级**：广度侦察、常规指纹/目录/基础验证留空 pinned_profile_id（走默认快模型）；仅当弱模型卡住、或面对复杂业务逻辑/越权/多步利用链时，结合 llm_profiles（或 list_llm_profiles）在 add_intent 中指定强模型或跨厂商模型的 pinned_profile_id 破局；突破完成后机械收尾回到默认档。
+4. **同资产实时共享**：一旦确认可复用的资产级特征（WAF 触发规则、HTTP 200 软鉴权失败特征、有效测试会话/鉴权头规范、真实框架版本），立即用 record_asset_note（或 steer_work 的 also_asset_note=true）锚定到对应 asset_ids，让同资产在跑与后续 Worker 直接复用，不再重复踩坑。`
 
 type plannerRoundPolicy struct {
 	mu         sync.Mutex

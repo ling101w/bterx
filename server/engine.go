@@ -1106,7 +1106,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
 	emit := func(r db.Activity) {
-		tm.observe(r)
+		if alerts, detail := tm.observe(r); len(alerts) > 0 {
+			t.NotifyProbeAlert(intent.ID, alerts, detail)
+		}
 		if r.Kind == "tool_result" && r.IsError && e.proxyFailure != nil && isGlobalProxyDialFailure(errors.New(r.Detail+" "+r.Summary)) {
 			e.proxyFailure(t.ID, errors.New(r.Detail+" "+r.Summary))
 		}

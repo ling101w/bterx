@@ -31,6 +31,9 @@ type Planner struct {
 	maxTurns          int                                    // max agent turns per run (0 = unlimited)
 	killWork          func(intentID int64) error             // engine callback to terminate a running work (nil = off)
 	steerWork         func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
+	listProfiles      func() []PlannerLLMProfile             // secret-free model profiles for active model tiering
+	validateProfile   func(profileID int64) (string, bool)   // validates pinned_profile_id before intent creation
+	runningTelemetry  func() []IntentTelemetryInfo           // live runtime probe telemetry for running intents
 	proxyAddr         string                                 // recording proxy for WebFetch (empty = direct)
 	proxyAddrFn       func() string
 	proxyCACert       string        // recording proxy's CA cert path (HTTPS verify)
@@ -127,6 +130,19 @@ func (p *Planner) SetKillWork(fn func(intentID int64) error) { p.killWork = fn }
 // steer_work tool can inject a mid-run course-correction into a running worker.
 func (p *Planner) SetSteerWork(fn func(intentID int64, msg string) error) { p.steerWork = fn }
 
+// SetProfileLister wires a callback returning available secret-free LLM profiles
+// so the unified Task Commander can make active model-tiering decisions.
+func (p *Planner) SetProfileLister(fn func() []PlannerLLMProfile) { p.listProfiles = fn }
+
+// SetProfileValidator wires a callback validating pinned_profile_id on add_intent.
+func (p *Planner) SetProfileValidator(fn func(profileID int64) (string, bool)) {
+	p.validateProfile = fn
+}
+
+// SetRunningTelemetry wires the engine's zero-cost in-memory runtime probe so
+// graph_overview surfaces live stall/error/loop alerts on running intents.
+func (p *Planner) SetRunningTelemetry(fn func() []IntentTelemetryInfo) { p.runningTelemetry = fn }
+
 // renderPlannerTodos formats the persistent planning todo for injection into the
 // wake-up prompt (empty when there are no todos yet — first wake-up).
 func renderPlannerTodos(items []actool.Todo) string {
@@ -150,14 +166,15 @@ func renderPlannerTodos(items []actool.Todo) string {
 // the planner looks first at the actual change instead of re-scanning the whole
 // overview. Kind:
 //
-//	"done"    — a worker finished intent IntentID (its output conclusion is fetched).
-//	"finding" — a worker reported a finding on intent IntentID (Detail = 摘要).
-//	"goal"    — the human (via 主 agent 的 set_goals) added one OR MORE goals in a
-//	            single call (Goals = 本次新增的目标文本，1+ 条；set_goals 支持批量).
+//	"done"        — a worker finished intent IntentID (its output conclusion is fetched).
+//	"finding"     — a worker reported a finding on intent IntentID (Detail = 摘要).
+//	"probe_alert" — the zero-cost runtime probe detected a stall/error/loop anomaly on intent IntentID.
+//	"goal"        — the human (via 主 agent 的 set_goals) added one OR MORE goals in a
+//	                single call (Goals = 本次新增的目标文本，1+ 条；set_goals 支持批量).
 //	"goal_deleted" — the human deleted a goal from 总览的目标管理 (Detail = 被删目标文本).
 //	"goal_edited"  — the human edited a goal from 总览的目标管理 (OldGoal→NewGoal 文本).
-//	"cancelled" — the human deleted intent IntentID (Detail = 删除原因). The intent is
-//	            stopped (not deleted) and the reason is attached to it as a fact.
+//	"cancelled"   — the human deleted intent IntentID (Detail = 删除原因). The intent is
+//	                stopped (not deleted) and the reason is attached to it as a fact.
 type TriggerEvent struct {
 	Kind     string
 	IntentID int64
@@ -199,6 +216,8 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 			b.WriteString(fmt.Sprintf("\n- 人修改了目标，由「%s」变为「%s」—— 请据新目标调整探索方向（原方向若已不适用请停派）。", ev.OldGoal, ev.NewGoal))
 		case "finding":
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 报告了一个 finding：%s", ev.IntentID, intentSummary(ts, ev.IntentID), ev.Detail))
+		case "probe_alert":
+			b.WriteString(fmt.Sprintf("\n- 【运行探针告警】意图 #%d（%s）触发异常：%s —— 请先 get_worker_trace 核查，再决定 steer_work 纠偏、kill_work 止损（写清 reason）或换更强模型（pinned_profile_id）重派。", ev.IntentID, intentSummary(ts, ev.IntentID), ev.Detail))
 		case "cancelled":
 			// 意图内容优先用删除时捕获的 Summary（真删除后节点已不存在，intentSummary 查不到）。
 			sm := ev.Summary
@@ -370,6 +389,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
+	tsx.listProfiles = p.listProfiles
+	tsx.validateProfile = p.validateProfile
+	tsx.runningTelemetry = p.runningTelemetry
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}
@@ -400,7 +422,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
-	sysBody := plannerSystem(goal, p.workDir, taskDir) + plannerDispatchInstruction
+	sysBody := plannerSystem(goal, p.workDir, taskDir) + plannerDispatchInstruction + plannerCommanderInstruction
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
 	}
@@ -468,14 +490,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// (心跳定时巡检 / hint / 恢复等) → 别谎称"图发生了变化",转而提示顺带复查在跑意图。
 	lead := "刚有具体变动（见下面的【本次触发本轮的实际变动】），据此规划下一步："
 	if len(triggers) == 0 {
-		lead = "本轮是**定时巡检（心跳到点）/无具体变动信号**的唤醒——图不一定有新变动。顺带复查在跑意图：长时间无进展或跑偏的用 steer_work 纠偏、方向整个错的用 kill_work 止损；再判定目标、决定是否补方向："
+		lead = "本轮是**定时巡检（心跳到点）/无具体变动信号**的唤醒——图不一定有新变动。请先看 chain_view 与 running_intents 中的探针告警（alerts），必要时 get_worker_trace 后 steer_work / kill_work 止损或换模型重派；再判定目标、决定是否补方向："
 		// 心跳/无变动唤醒时,若全图已无任何 open 或 running 意图 → 探索已停摆(没 worker 在跑、
-		// 也没排队方向)。明确告知 planner 并强制其本轮补出新方向,别只复查在跑意图后空转一轮。
+		// 也没排队方向)。优先补有效方向；若确因缺前提/无合理方向无法推进，调 planner_decision 如实说明，不硬凑废活。
 		if active, err := ts.HasActiveIntent(); err == nil && !active {
-			lead = "本轮是**定时巡检（心跳到点）**的唤醒,且当前**已没有任何 open 或 running 的意图**——没有 worker 在跑、也没有排队中的方向,探索已停摆。你**必须**在本轮产出一个或多个向目标推进、且与图中既有意图**互不重复**的新意图(不得产出 0 意图);先据下面的态势判定目标是否已达成,未达成则立即补方向："
+			lead = "本轮是**定时巡检（心跳到点）**的唤醒，且当前**已没有任何 open 或 running 意图**。请先核对目标是否达成、检查 recent_stopped_intents 与 retracted_facts 避免重踩死路；有未覆盖且可推进的新方向时立即 add_intent 派发，若确因缺少前置条件/权限/新证据而暂无合理方向，请调用 planner_decision 如实说明原因（不要为凑数编造无效意图）："
 		}
 	}
-	input := lead + situational + "\n\n据上面的态势，判定目标。目标已【真正达成】（已拿到目标成果/已确认目标漏洞）时用 prove_goal 逐个标记。**硬底线：只要目标尚未达成、且当前没有任何 open 或 running 意图（frontier_open=0 且 running_intents 为空），本轮就必须产出至少一个向目标推进的意图——此时没有在跑的 work 可等、也没有在排队的方向，产出 0 意图=任务停摆。仅当已有 open/running 意图在推进、或目标已达成时，本轮才可以不产出新意图。**" +
+	input := lead + situational + "\n\n据上面的态势，判定目标。目标已【真正达成】（已拿到目标成果/已确认目标漏洞）时用 prove_goal 逐个标记。若目标未达成且当前无 open/running 意图（frontier_open=0 且 running_intents 为空），请优先派发未覆盖的新方向；若确因缺少前置条件或所有已知方向已证伪而无合理新意图，调用 planner_decision 如实说明原因，禁止编造重复或无意义意图。" +
 		renderPlannerTodos(opts.Todos.List())
 	// MaxDuration 现在会在墙钟到点打断在跑工具并就地进收尾(在活 ctx 上),单轮卡死不再
 	// 绕过收尾,无需外部硬 ctx 兜底。ctx 只承载 pause / kill / shutdown。

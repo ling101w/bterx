@@ -115,6 +115,20 @@ ORDER BY id ASC`, s.expID, rootNodeID)
 	return scanNodes(rows)
 }
 
+// SetIntentStopReason records a concise stop-loss reason on an intent node's
+// delete_reason column (without changing its state) so subsequent planner rounds
+// see why an intent was stopped and avoid re-dispatching the same dead end.
+func (s *ExplorationStore) SetIntentStopReason(intentID int64, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if intentID <= 0 || reason == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE exploration_nodes
+SET delete_reason=$1, content_version=content_version+1
+WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, utf8Clean(reason), intentID, s.expID)
+	return err
+}
+
 // AssetNotesForAssets returns recent active asset-scoped notes/pitfalls anchored
 // to any of assetIDs within this exploration. Retracted, disputed, unverified, and
 // origin nodes are excluded so workers only receive verified, live asset intel.

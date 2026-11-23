@@ -456,13 +456,14 @@ func (s *Server) toolSupervisorKillIntent() actool.CoreTool {
 					"note": "意图已处于终态，无需终止",
 				})
 			}
+			_ = t.Store.SetIntentStopReason(iid, reason)
 			nid := iid
 			msg := fmt.Sprintf("Supervisor 止损终止意图 #%d（原状态 %s）：%s", iid, prev, reason)
 			s.engine.emitActivity(t, db.Activity{
 				NodeID: &nid, Worker: supervisorWorkerName, Kind: "text",
 				Summary: preview(msg, 200), Detail: msg,
 			})
-			t.Notify()
+			t.NotifyHint([]string{msg})
 			return jsonResult(map[string]any{
 				"intent_id": iid, "previous_state": prev, "stopped": true, "killed_live": killedLive,
 			})

@@ -2441,6 +2441,27 @@ func (t *Task) NotifyCancelled(intentID int64, summary, reason string) {
 	t.Notify()
 }
 
+// NotifyProbeAlert wakes the task's Planner (Commander) immediately when the
+// zero-cost runtime probe flags an anomaly (consecutive errors, repeated tool
+// loop, or stall) on a running worker intent.
+func (t *Task) NotifyProbeAlert(intentID int64, alerts []string, detail string) {
+	if intentID <= 0 || len(alerts) == 0 {
+		return
+	}
+	msg := strings.Join(alerts, ", ")
+	if d := strings.TrimSpace(detail); d != "" {
+		msg += "（" + d + "）"
+	}
+	t.trigMu.Lock()
+	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{
+		Kind:     "probe_alert",
+		IntentID: intentID,
+		Detail:   msg,
+	})
+	t.trigMu.Unlock()
+	t.Notify()
+}
+
 // drainTriggers returns and clears the trigger events accumulated since the last round.
 func (t *Task) drainTriggers() []agent.TriggerEvent {
 	t.trigMu.Lock()

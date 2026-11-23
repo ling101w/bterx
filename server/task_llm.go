@@ -603,6 +603,18 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
+	pl.SetProfileLister(s.plannerLLMProfiles)
+	pl.SetProfileValidator(func(id int64) (string, bool) {
+		_, cfg, ok := s.providerForProfile(id)
+		if !ok {
+			return "", false
+		}
+		return cfg.Model, true
+	})
+	taskID := t.ID
+	pl.SetRunningTelemetry(func() []agent.IntentTelemetryInfo {
+		return s.engine.RunningIntentTelemetryForPlanner(taskID)
+	})
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetProxyProvider(s.m.ProxyAddr)
 	pl.SetWebSearch(s.webSearchFor("planner"))
@@ -627,6 +639,24 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	}
 	s.taskAgents[t.ID] = bundle
 	return bundle
+}
+
+func (s *Server) plannerLLMProfiles() []agent.PlannerLLMProfile {
+	profs, err := s.m.pg.ListProfiles()
+	if err != nil {
+		return nil
+	}
+	out := make([]agent.PlannerLLMProfile, 0, len(profs))
+	for _, p := range profs {
+		out = append(out, agent.PlannerLLMProfile{
+			ID:        p.ID,
+			Name:      p.Name,
+			Model:     p.Model,
+			Format:    p.Format,
+			IsDefault: p.IsDefault,
+		})
+	}
+	return out
 }
 
 func (s *Server) workerForTaskSlot(t *Task, slot WorkerSlot) (*agent.Worker, error) {

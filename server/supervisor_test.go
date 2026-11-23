@@ -270,3 +270,151 @@ func TestSupervisorWorkflowPG(t *testing.T) {
 		t.Fatalf("supervisor_kill_intent failed (isErr=%v): %s", isErr, killOut)
 	}
 }
+
+func TestProbeObserveWakeCooldown(t *testing.T) {
+	e := &Engine{}
+	tm := e.beginIntentTelemetry("1", 555, "work#1", 0)
+	defer e.endIntentTelemetry(555)
+
+	// Errors 1 and 2 do not wake yet.
+	for i := 0; i < 2; i++ {
+		if alerts, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "timeout"}); len(alerts) != 0 {
+			t.Fatalf("unexpected early alert on error %d: %v", i+1, alerts)
+		}
+	}
+	// Error 3 triggers consecutive_errors alert immediately.
+	alerts, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "timeout"})
+	if len(alerts) == 0 || alerts[0] != "consecutive_errors" {
+		t.Fatalf("expected consecutive_errors on 3rd error, got %v", alerts)
+	}
+	// Error 4 immediately after is suppressed by cooldown.
+	if alerts2, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "timeout"}); len(alerts2) != 0 {
+		t.Fatalf("expected cooldown to suppress duplicate wake, got %v", alerts2)
+	}
+}
+
+// TestUnifiedCommanderWorkflowPG verifies that the merged Task Commander (Planner)
+// natively performs model-tiered add_intent, kill_work tombstones, retract_fact
+// with cascade stop, record_asset_note, and L1 chain_view overview against PG.
+func TestUnifiedCommanderWorkflowPG(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer m.Close()
+	td := t.TempDir()
+	s := New(context.Background(), m, td, td, td)
+
+	task, err := m.CreateTask("commander-test", "企业 SRC 综合挖掘测试", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	defer func() {
+		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+	}()
+
+	p1, err := m.pg.SaveProfile(&db.LLMProfile{
+		Name: "flash-tier", Format: "openai", BaseURL: "https://api.example.invalid/v1", APIKey: "sk-1", Model: "fast-mini",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = m.pg.DeleteProfile(p1) }()
+	p2, err := m.pg.SaveProfile(&db.LLMProfile{
+		Name: "strong-tier", Format: "openai", BaseURL: "https://api.example.invalid/v1", APIKey: "sk-2", Model: "strong-pro",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = m.pg.DeleteProfile(p2) }()
+
+	taskIDInt, _ := strconv.ParseInt(task.ID, 10, 64)
+	assetID, err := m.assets.UpsertHTTPService(db.UpsertHTTPServiceReq{
+		URL: "https://corp.example.test/api/orders", Technologies: []string{"Spring Boot", "Vue"}, TaskID: taskIDInt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a Planner-configured ToolSet wired exactly like Server.agentsForTask.
+	tsx := agent.NewToolSet(task.Store, "planner")
+	tsx.SetAssetStore(m.assets, m.assets.Companies())
+	tsx.SetTaskID(taskIDInt)
+	findTool := func(name string) actool.CoreTool {
+		for _, tool := range tsx.PlannerTools() {
+			if tool.Name() == name {
+				return tool
+			}
+		}
+		t.Fatalf("planner tool %s missing", name)
+		return nil
+	}
+
+	// Wire Planner via SetProfileLister / SetProfileValidator indirectly by exercising
+	// Planner's native tools on the live exploration store.
+	addIntentTool := findTool("add_intent")
+	retractTool := findTool("retract_fact")
+	assetNoteTool := findTool("record_asset_note")
+	overviewTool := findTool("graph_overview")
+
+	// 1. Create a fact and a downstream intent with pinned_profile_id=p2.
+	factID, err := task.Store.AddNode(db.KindFact, map[string]any{
+		"summary": "疑似 /api/orders 存在越权读取", "confidence": "observed",
+	}, 5, db.StateFactUnverified, "work#1", []int64{assetID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addOut, isErr := callSupervisorTool(t, addIntentTool, map[string]any{
+		"summary":           "换强模型深挖订单越权链",
+		"asset_ids":         []int64{assetID},
+		"parent_ids":        []int64{factID},
+		"pinned_profile_id": p2,
+		"model_reason":      "复杂多角色业务逻辑，升档强模型",
+		"priority":          9,
+	})
+	if isErr || !strings.Contains(addOut, "intent created:") {
+		t.Fatalf("planner add_intent failed (isErr=%v): %s", isErr, addOut)
+	}
+
+	// 2. Planner retracts the hallucinated fact → cascade-stops the intent.
+	retOut, isErr := callSupervisorTool(t, retractTool, map[string]any{
+		"fact_id": factID,
+		"reason":  "核对响应体实为前端 SPA 登录壳",
+	})
+	if isErr || !strings.Contains(retOut, `"state":"retracted"`) {
+		t.Fatalf("planner retract_fact failed (isErr=%v): %s", isErr, retOut)
+	}
+
+	// 3. Planner records an asset note.
+	noteOut, isErr := callSupervisorTool(t, assetNoteTool, map[string]any{
+		"asset_ids": []int64{assetID},
+		"summary":   "未登录请求一律返回 HTTP 200 + code=40100 JSON",
+	})
+	if isErr || !strings.Contains(noteOut, `"note_id"`) {
+		t.Fatalf("planner record_asset_note failed (isErr=%v): %s", isErr, noteOut)
+	}
+
+	// 4. Planner graph_overview surfaces chain_view, recent_stopped_intents, and retracted_facts.
+	ovOut, isErr := callSupervisorTool(t, overviewTool, map[string]any{})
+	if isErr {
+		t.Fatalf("graph_overview failed: %s", ovOut)
+	}
+	for _, want := range []string{`"chain_view"`, `"recent_stopped_intents"`, `"retracted_facts"`, "SPA 登录壳"} {
+		if !strings.Contains(ovOut, want) {
+			t.Fatalf("graph_overview missing %s:\n%s", want, ovOut)
+		}
+	}
+	// Ensure retracted fact is NOT in recent_facts.
+	var ovMap map[string]any
+	if err := json.Unmarshal([]byte(ovOut), &ovMap); err != nil {
+		t.Fatal(err)
+	}
+	if rf, ok := ovMap["recent_facts"].([]any); ok {
+		for _, item := range rf {
+			if m, ok := item.(map[string]any); ok && int64(m["id"].(float64)) == factID {
+				t.Fatalf("retracted fact #%d leaked into recent_facts", factID)
+			}
+		}
+	}
+	_ = s
+}

@@ -77,6 +77,11 @@ type ToolSet struct {
 	// intent id (engine callback, wired by the planner): the worker injects it before
 	// its next tool call and re-plans, without being killed. nil = tool unavailable.
 	steerWork func(intentID int64, msg string) error
+	// Commander callbacks wired by Planner for active model tiering and live
+	// runtime anomaly visibility. nil = unavailable / no-op.
+	listProfiles     func() []PlannerLLMProfile
+	validateProfile  func(profileID int64) (model string, ok bool)
+	runningTelemetry func() []IntentTelemetryInfo
 	// enrich, if set, receives async auto-completion triggers (DNS resolve for a
 	// domain, HTTP probe for a site). nil = no engine enrichment.
 	enrich EnrichTrigger
@@ -416,7 +421,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	fr, _ := t.ts.Frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
 	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
 	all, _ := t.ts.ListByKind(db.KindIntent, 300)
-	var running, recentDone []*db.Node
+	var running, recentDone, recentStopped []*db.Node
 	for _, n := range all {
 		switch n.State {
 		case "running":
@@ -426,9 +431,54 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 				continue // in a cold_digest and still cold — shown via cold_digests (§6.2)
 			}
 			recentDone = append(recentDone, n) // 最新在前（all 按 id 降序）；折叠的已剔除，输出时截最新 N
+		case "stopped":
+			if len(recentStopped) < 6 {
+				recentStopped = append(recentStopped, n)
+			}
 		}
 	}
-	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
+	tmByIntent := map[int64]IntentTelemetryInfo{}
+	if t.runningTelemetry != nil {
+		for _, tm := range t.runningTelemetry() {
+			tmByIntent[tm.IntentID] = tm
+		}
+	}
+	runningCompact := compactIntents(running, parentsOf, yieldsOf)
+	for i, n := range running {
+		if i >= len(runningCompact) {
+			break
+		}
+		var ip map[string]any
+		if json.Unmarshal(n.Payload, &ip) == nil {
+			if pin, ok := ip["pinned_profile_id"]; ok && pin != nil {
+				runningCompact[i]["pinned_profile_id"] = pin
+			}
+		}
+		if tm, ok := tmByIntent[n.ID]; ok {
+			runningCompact[i]["running_seconds"] = tm.RunningSeconds
+			runningCompact[i]["idle_seconds"] = tm.IdleSeconds
+			runningCompact[i]["tool_calls"] = tm.ToolCalls
+			runningCompact[i]["tool_errors"] = tm.ToolErrors
+			runningCompact[i]["consecutive_errors"] = tm.ConsecutiveErrors
+			runningCompact[i]["repeated_tool_calls"] = tm.RepeatedToolCalls
+			runningCompact[i]["facts_written"] = tm.FactsWritten
+			if len(tm.Alerts) > 0 {
+				runningCompact[i]["alerts"] = tm.Alerts
+			}
+		}
+	}
+	out["running_intents"] = runningCompact
+	if len(recentStopped) > 0 {
+		stoppedOut := make([]map[string]any, 0, len(recentStopped))
+		for _, n := range recentStopped {
+			m := compactNode(n)
+			if r := strings.TrimSpace(n.DeleteReason); r != "" {
+				m["stop_reason"] = truncateRunes(r, 140)
+			}
+			stoppedOut = append(stoppedOut, m)
+		}
+		out["recent_stopped_intents"] = stoppedOut
+	}
 	// done_intents_total：已结束意图（done/blocked/exhausted）总数，与 recent_done_intents
 	// 平行命名——后者只是它的最新窗口截断视图。两键并排即自描述："看到的是 N/总数"，
 	// 让 planner 去重时别把"没显示"当成"没派过"，无需在提示词里另行解释。
@@ -473,12 +523,25 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// confidence?}；evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。
 	const recentFactsCap = 20
 	recentFacts := make([]map[string]any, 0, recentFactsCap)
+	var retractedFacts []map[string]any
 	for _, n := range factNodes {
-		if len(recentFacts) >= recentFactsCap {
-			break
-		}
 		if n.State == db.StateFactRetracted {
-			continue // Supervisor 已撤回的假事实不再进入规划概览，保留原节点审计
+			if len(retractedFacts) < 6 {
+				rm := compactNode(n)
+				var fp map[string]any
+				if json.Unmarshal(n.Payload, &fp) == nil {
+					if r, ok := fp["retraction"].(map[string]any); ok {
+						if reason, _ := r["reason"].(string); reason != "" {
+							rm["reason"] = truncateRunes(reason, 140)
+						}
+					}
+				}
+				retractedFacts = append(retractedFacts, rm)
+			}
+			continue // 已撤回的假事实不进入 recent_facts，仅在 retracted_facts 留墓碑防重踩
+		}
+		if len(recentFacts) >= recentFactsCap {
+			continue
 		}
 		if hidden(n.ID) {
 			continue // 已折进 digest 且仍冷 —— 见 cold_digests
@@ -507,6 +570,36 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		recentFacts = append(recentFacts, m)
 	}
 	out["recent_facts"] = recentFacts
+	if len(retractedFacts) > 0 {
+		out["retracted_facts"] = retractedFacts
+	}
+	// L1 分层探索链路视图：按主资产/分支归拢活跃意图、漏洞、近期事实与墓碑，
+	// 让规划指挥官一眼看清各条攻击线进展、探针告警和已证伪分支。
+	anchorIDs := make([]int64, 0, len(all)+len(factNodes)+len(vulnNodes))
+	for _, n := range all {
+		anchorIDs = append(anchorIDs, n.ID)
+	}
+	for i, n := range factNodes {
+		if i >= 60 {
+			break
+		}
+		anchorIDs = append(anchorIDs, n.ID)
+	}
+	for i, n := range vulnNodes {
+		if i >= 20 {
+			break
+		}
+		anchorIDs = append(anchorIDs, n.ID)
+	}
+	nodeAnchors, _ := t.ts.NodeAnchors(anchorIDs)
+	if chain := buildLayeredChainView(all, factNodes, vulnNodes, nodeAnchors, tmByIntent); len(chain) > 0 {
+		out["chain_view"] = chain
+	}
+	if t.listProfiles != nil {
+		if profs := t.listProfiles(); len(profs) > 1 {
+			out["llm_profiles"] = profs
+		}
+	}
 	// recent_done_intents：非折叠的已结束意图里最新的一窗（≤N，recentDone 已按 id 降序）。
 	// 更早的看 done_intents_total 计数 + node_detail(id)。
 	const recentDoneCap = 12
@@ -1035,11 +1128,13 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
-	Summary        string             `json:"summary"`
-	AssetIDs       []json.RawMessage  `json:"asset_ids"`
-	ParentIDs      []json.RawMessage  `json:"parent_ids"`
-	ExperienceRefs []db.ExperienceRef `json:"experience_refs"`
-	Priority       int                `json:"priority"`
+	Summary         string             `json:"summary"`
+	AssetIDs        []json.RawMessage  `json:"asset_ids"`
+	ParentIDs       []json.RawMessage  `json:"parent_ids"`
+	ExperienceRefs  []db.ExperienceRef `json:"experience_refs"`
+	Priority        int                `json:"priority"`
+	PinnedProfileID json.RawMessage    `json:"pinned_profile_id"`
+	ModelReason     string             `json:"model_reason"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1056,6 +1151,15 @@ func (t *ToolSet) addOneIntentContext(ctx context.Context, it intentItem) (int64
 	}
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
+	}
+	pinnedID := pid(it.PinnedProfileID)
+	var pinnedModel string
+	if pinnedID > 0 && t.validateProfile != nil {
+		model, ok := t.validateProfile(pinnedID)
+		if !ok {
+			return 0, fmt.Errorf("pinned_profile_id #%d 不存在或配置无效（请先看 llm_profiles 或调 list_llm_profiles）", pinnedID)
+		}
+		pinnedModel = model
 	}
 	// 先校验锚点（建节点前，避免坏锚点留下孤儿意图）。
 	parents := pidList(it.ParentIDs)
@@ -1113,6 +1217,15 @@ func (t *ToolSet) addOneIntentContext(ctx context.Context, it intentItem) (int64
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
+	if pinnedID > 0 {
+		payload["pinned_profile_id"] = pinnedID
+		if pinnedModel != "" {
+			payload["pinned_model"] = pinnedModel
+		}
+		if mr := strings.TrimSpace(it.ModelReason); mr != "" {
+			payload["model_reason"] = mr
+		}
+	}
 	if len(parents) == 0 {
 		if origin, _ := t.ts.OriginFactID(); origin > 0 {
 			parents = []int64{origin}
@@ -1127,14 +1240,17 @@ func (t *ToolSet) addOneIntentContext(ctx context.Context, it intentItem) (int64
 
 func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
-		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
+		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。\n"+
+		"★主动模型分级：常规信息收集/广度扫描留空 pinned_profile_id（走默认快模型）；仅当弱模型卡住、或面对复杂业务逻辑/多步利用链时，传 pinned_profile_id 升档到强模型或换厂商破局。",
 		obj(map[string]any{
-			"intents":         map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":         str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
-			"asset_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
-			"parent_ids":      map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
-			"experience_refs": map[string]any{"type": "array", "maxItems": 3, "description": "可选：实际采用的历史方法及刚读取的revision；不是当前事实或授权。程序自动登记adopted。", "items": obj(map[string]any{"id": str("真实经验编号"), "revision": str("search/get返回的revision")}, "id", "revision")},
-			"priority":        intp("优先级 0-10，默认5"),
+			"intents":           map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/pinned_profile_id/model_reason）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"summary":           str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
+			"asset_ids":         map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
+			"parent_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示，也不能填已被撤回(retracted)的事实**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
+			"experience_refs":   map[string]any{"type": "array", "maxItems": 3, "description": "可选：实际采用的历史方法及刚读取的revision；不是当前事实或授权。程序自动登记adopted。", "items": obj(map[string]any{"id": str("真实经验编号"), "revision": str("search/get返回的revision")}, "id", "revision")},
+			"priority":          intp("优先级 0-10，默认5"),
+			"pinned_profile_id": idp("可选：主动模型分级。指定执行本意图的 LLM profile id（来自 llm_profiles / list_llm_profiles）；常规任务留空走默认档，复杂攻坚或弱模型卡住时升档强模型/跨厂商模型"),
+			"model_reason":      str("可选：传 pinned_profile_id 时简要说明升档/换模型理由"),
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1790,16 +1906,21 @@ func (t *ToolSet) addHint() actool.CoreTool {
 		})
 }
 
-// killWorkTool lets the planner terminate a single running work (by intent id).
+// killWorkTool lets the planner terminate a running (or queued/paused) intent
+// and record a concise stop_reason tombstone so future rounds don't re-dispatch it.
 func (t *ToolSet) killWorkTool() actool.CoreTool {
-	return t.writeExpTool("kill_work", "终止一条正在运行的意图(work)。用于叫停跑偏/无意义的探索；被终止的意图标记为 stopped，不再自动重领。先用 get_worker_output 看看它在干嘛再决定。",
-		obj(map[string]any{"intent_id": idp("要终止的意图 id（= work 句柄）")}, "intent_id"),
+	return t.writeExpTool("kill_work", "终止一条正在运行（或尚未执行）的意图(work)。用于叫停空转、连错、重复循环或无意义的探索；被终止的意图标记为 stopped 并保留 stop_reason 墓碑，不再自动重领。先用 get_worker_trace / get_worker_output 核实再决定。",
+		obj(map[string]any{
+			"intent_id": idp("要终止的意图 id（= work 句柄）"),
+			"reason":    str("可选但强烈建议：一句话止损原因（写入墓碑，防止后续轮次重复派发同一方向）"),
+		}, "intent_id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.killWork == nil {
 				return actool.Errorf("kill_work 当前不可用"), nil
 			}
 			var a struct {
 				IntentID json.RawMessage `json:"intent_id"`
+				Reason   string          `json:"reason"`
 			}
 			_ = json.Unmarshal(in, &a)
 			id := pid(a.IntentID)
@@ -1810,30 +1931,44 @@ func (t *ToolSet) killWorkTool() actool.CoreTool {
 			if err != nil || node == nil || node.Kind != db.KindIntent {
 				return actool.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）"), nil
 			}
-			if err := t.killWork(id); err != nil {
-				return actool.Errorf(err.Error()), nil
+			switch node.State {
+			case "open", "paused":
+				if ok, err := t.ts.CompareAndSetIntentState(id, node.State, "stopped"); err != nil {
+					return actool.Errorf(err.Error()), nil
+				} else if !ok {
+					return actool.Errorf("意图状态已变更，请刷新后重试"), nil
+				}
+			default:
+				if err := t.killWork(id); err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+			}
+			if reason := strings.TrimSpace(a.Reason); reason != "" {
+				_ = t.ts.SetIntentStopReason(id, reason)
 			}
 			return actool.Text(fmt.Sprintf("已向意图 %d 的 work 发送终止信号", id)), nil
 		})
 }
 
-// steerWorkTool lets the planner inject a mid-run course-correction into a running
-// work WITHOUT killing it: the message reaches the worker before its next tool call,
-// which re-plans its next step (already-gathered context is kept). For in-intent
-// nudges ("停做 X、聚焦 Y"); if the whole direction is wrong use kill_work + a new intent.
+// steerWorkTool lets the planner inject a mid-run course-correction or live intel
+// into a running work WITHOUT killing it, optionally persisting it as an asset note.
 func (t *ToolSet) steerWorkTool() actool.CoreTool {
-	return t.writeExpTool("steer_work", "给一条正在运行的意图(work)实时注入纠偏指令，不打断它、不丢已有进展：worker 会在下一步动作前收到你的指令并据此调整。用于'别再走 X、聚焦 Y'这类【意图内】纠偏；若方向整个错了应改用 kill_work 再下新意图。建议先用 get_worker_output 看它在干嘛。",
+	return t.writeExpTool("steer_work", "给一条正在运行的意图(work)实时注入情报或纠偏指令，不打断它、不丢已有进展：worker 会在下一步动作前收到你的指令并据此调整。用于'别再走 X、聚焦 Y'或跨 Worker 实时搬运 WAF/鉴权情报；若方向整个错了应改用 kill_work 再下新意图。可选 also_asset_note=true 同时存为同资产共享备注。",
 		obj(map[string]any{
-			"intent_id": idp("要纠偏的意图 id（= work 句柄）"),
-			"message":   str("给 worker 的纠偏指令，明确让它停止什么、转向什么"),
+			"intent_id":       idp("要纠偏的意图 id（= work 句柄）"),
+			"message":         str("给 worker 的实时情报或纠偏指令，明确让它停止什么、转向什么或复用什么特征"),
+			"also_asset_note": map[string]any{"type": "boolean", "description": "可选：若为 true，同时将本条情报落盘为同资产共享备注，后续同资产新 Worker 自动注入"},
+			"asset_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：also_asset_note=true 时锚定的资产 id（省略则继承该意图的 asset_ids）"},
 		}, "intent_id", "message"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.steerWork == nil {
 				return actool.Errorf("steer_work 当前不可用"), nil
 			}
 			var a struct {
-				IntentID json.RawMessage `json:"intent_id"`
-				Message  string          `json:"message"`
+				IntentID      json.RawMessage   `json:"intent_id"`
+				Message       string            `json:"message"`
+				AlsoAssetNote bool              `json:"also_asset_note"`
+				AssetIDs      []json.RawMessage `json:"asset_ids"`
 			}
 			_ = json.Unmarshal(in, &a)
 			id := pid(a.IntentID)
@@ -1844,11 +1979,29 @@ func (t *ToolSet) steerWorkTool() actool.CoreTool {
 			if err != nil || node == nil || node.Kind != db.KindIntent {
 				return actool.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）"), nil
 			}
-			if strings.TrimSpace(a.Message) == "" {
+			msg := strings.TrimSpace(a.Message)
+			if msg == "" {
 				return actool.Errorf("message 必填"), nil
 			}
-			if err := t.steerWork(id, a.Message); err != nil {
+			if err := t.steerWork(id, msg); err != nil {
 				return actool.Errorf(err.Error()), nil
+			}
+			if a.AlsoAssetNote {
+				aids := dedupInt64(pidList(a.AssetIDs))
+				if len(aids) == 0 {
+					aids = intentAssetIDs(node)
+				}
+				if len(aids) > 0 {
+					if noteID, noteErr := t.ts.AddNode(db.KindFact, map[string]any{
+						"summary":    truncateRunes(msg, 180),
+						"detail":     msg,
+						"asset_note": true,
+						"confidence": "observed",
+					}, 6, db.StateFactConfirmed, "planner", aids); noteErr == nil {
+						t.writes.Facts++
+						return actool.Text(fmt.Sprintf("已向意图 %d 的 work 注入纠偏指令（下一步生效），并同步登记资产共享备注 #%d", id, noteID)), nil
+					}
+				}
 			}
 			return actool.Text(fmt.Sprintf("已向意图 %d 的 work 注入纠偏指令（下一步生效）", id)), nil
 		})
@@ -2168,5 +2321,9 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// Unified Task Commander tools: retract hallucinated facts (with cascade stop)
+		// and persist asset-scoped shared notes for automatic worker push.
+		t.retractFactTool(),
+		t.recordAssetNoteTool(),
 	}
 }

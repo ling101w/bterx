@@ -16,11 +16,12 @@ const (
 	probeLongRunNoOutputWindow = 10 * time.Minute
 	probeConsecutiveErrorLimit = 3
 	probeRepeatedToolCallLimit = 4
+	probeAlertWakeCooldown     = 3 * time.Minute
 )
 
 // intentTelemetry tracks zero-cost in-memory runtime health metrics for one
-// running worker intent so the Supervisor board can flag stalls, error loops,
-// and zero-output runs without scanning raw logs.
+// running worker intent so the Task Commander (Planner) and Supervisor board
+// can flag stalls, error loops, and zero-output runs without scanning raw logs.
 type intentTelemetry struct {
 	mu                sync.Mutex
 	taskID            string
@@ -29,6 +30,7 @@ type intentTelemetry struct {
 	pinnedProfileID   int64
 	startedAt         time.Time
 	lastActAt         time.Time
+	lastAlertAt       time.Time
 	toolCalls         int
 	toolErrors        int
 	consecutiveErrors int
@@ -56,8 +58,8 @@ type IntentTelemetrySnapshot struct {
 	Alerts            []string `json:"alerts,omitempty"`
 }
 
-// intentPinnedProfileID extracts an optional Supervisor-assigned model profile
-// id from an intent node's JSON payload. Returns 0 when absent or invalid.
+// intentPinnedProfileID extracts an optional Commander/Supervisor-assigned model
+// profile id from an intent node's JSON payload. Returns 0 when absent or invalid.
 func intentPinnedProfileID(intent *db.Node) int64 {
 	if intent == nil || len(intent.Payload) == 0 {
 		return 0
@@ -93,13 +95,17 @@ func (e *Engine) endIntentTelemetry(intentID int64) {
 	e.telemetry.Delete(intentID)
 }
 
-func (tm *intentTelemetry) observe(r db.Activity) {
+// observe updates in-memory telemetry for one emitted activity and returns
+// immediate anomaly alerts (rate-limited by probeAlertWakeCooldown) when the
+// Task Commander should be woken proactively.
+func (tm *intentTelemetry) observe(r db.Activity) (alerts []string, detail string) {
 	if tm == nil {
-		return
+		return nil, ""
 	}
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	tm.lastActAt = time.Now()
+	now := time.Now()
+	tm.lastActAt = now
 	switch r.Kind {
 	case "tool_use":
 		tm.toolCalls++
@@ -124,6 +130,21 @@ func (tm *intentTelemetry) observe(r db.Activity) {
 			}
 		}
 	}
+	if tm.consecutiveErrors >= probeConsecutiveErrorLimit {
+		alerts = append(alerts, "consecutive_errors")
+	}
+	if tm.repeatedToolCalls >= probeRepeatedToolCallLimit {
+		alerts = append(alerts, "repeated_tool_loop")
+	}
+	if len(alerts) == 0 {
+		return nil, ""
+	}
+	if !tm.lastAlertAt.IsZero() && now.Sub(tm.lastAlertAt) < probeAlertWakeCooldown {
+		return nil, ""
+	}
+	tm.lastAlertAt = now
+	detail = preview(strings.TrimSpace(r.Tool+" "+r.Summary), 120)
+	return alerts, detail
 }
 
 func (tm *intentTelemetry) snapshot(now time.Time) IntentTelemetrySnapshot {
@@ -184,6 +205,30 @@ func (e *Engine) RunningIntentTelemetry(taskID string) []IntentTelemetrySnapshot
 		return true
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].IntentID < out[j].IntentID })
+	return out
+}
+
+// RunningIntentTelemetryForPlanner converts live engine snapshots into the
+// agent-layer representation consumed by the unified Task Commander.
+func (e *Engine) RunningIntentTelemetryForPlanner(taskID string) []agent.IntentTelemetryInfo {
+	snaps := e.RunningIntentTelemetry(taskID)
+	out := make([]agent.IntentTelemetryInfo, len(snaps))
+	for i, s := range snaps {
+		out[i] = agent.IntentTelemetryInfo{
+			IntentID:          s.IntentID,
+			Worker:            s.Worker,
+			PinnedProfileID:   s.PinnedProfileID,
+			RunningSeconds:    s.RunningSeconds,
+			IdleSeconds:       s.IdleSeconds,
+			ToolCalls:         s.ToolCalls,
+			ToolErrors:        s.ToolErrors,
+			ConsecutiveErrors: s.ConsecutiveErrors,
+			RepeatedToolCalls: s.RepeatedToolCalls,
+			FactsWritten:      s.FactsWritten,
+			FindingsWritten:   s.FindingsWritten,
+			Alerts:            s.Alerts,
+		}
+	}
 	return out
 }
 

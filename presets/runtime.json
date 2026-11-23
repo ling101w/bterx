@@ -742,7 +742,26 @@
       "enabled": true,
       "kind": "builtin",
       "agents": [
-        "auto"
+        "auto",
+        "planner"
+      ]
+    },
+    {
+      "key": "retract_fact",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "planner"
+      ]
+    },
+    {
+      "key": "record_asset_note",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "planner"
       ]
     },
     {
