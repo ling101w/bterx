@@ -155,6 +155,7 @@ type Engine struct {
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness    func() bool
 	proxyFailure func(taskID string, err error)
+	telemetry    sync.Map // intentID (int64) -> *intentTelemetry
 }
 
 func (e *Engine) SetProxyFailureHandler(fn func(string, error)) { e.proxyFailure = fn }
@@ -1076,8 +1077,13 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 	if intent == nil {
 		return false
 	}
-	log.Printf("[worker %s] task %s 领取意图 #%d", name, t.ID, intent.ID)
-	return e.runIntent(ctx, t, name, worker, intent, "", "")
+	chosenWorker, pinnedID := e.resolveWorkerForIntent(t, name, intent, worker)
+	if pinnedID > 0 {
+		log.Printf("[worker %s] task %s 领取意图 #%d (pinned profile #%d)", name, t.ID, intent.ID, pinnedID)
+	} else {
+		log.Printf("[worker %s] task %s 领取意图 #%d", name, t.ID, intent.ID)
+	}
+	return e.runIntent(ctx, t, name, chosenWorker, intent, "", "")
 }
 
 // runIntent executes and fully settles one already-claimed (state=running) intent.
@@ -1089,6 +1095,8 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 // must already hold one task-operation admission for the whole sequence so a delete
 // cannot observe quiescence between the LLM return and the final DB writes.
 func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *agent.Worker, intent *db.Node, requestID, message string) bool {
+	tm := e.beginIntentTelemetry(t.ID, intent.ID, name, intentPinnedProfileID(intent))
+	defer e.endIntentTelemetry(intent.ID)
 	defer func() {
 		if err := t.Store.SealIntentExperiences(intent.ID); err != nil {
 			log.Printf("[experience] result linkage for intent %d failed: %v", intent.ID, err)
@@ -1098,6 +1106,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
 	emit := func(r db.Activity) {
+		tm.observe(r)
 		if r.Kind == "tool_result" && r.IsError && e.proxyFailure != nil && isGlobalProxyDialFailure(errors.New(r.Detail+" "+r.Summary)) {
 			e.proxyFailure(t.ID, errors.New(r.Detail+" "+r.Summary))
 		}
@@ -1312,18 +1321,32 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	}
 	owner := node.Owner
 	var worker *agent.Worker
-	if value, ok := e.slotPlans.Load(t.ID); ok {
-		if plan, ok := value.(map[string]int64); ok {
-			if profileID, pinned := plan[owner]; pinned && profileID > 0 {
-				if e.workerResolve == nil {
-					return fmt.Errorf("意图所属的 LLM 配置 #%d 不可用：pinned worker resolver unavailable", profileID)
-				}
-				worker, err = e.workerResolve(t, WorkerSlot{Name: owner, ProfileID: profileID})
-				if err != nil || worker == nil {
-					if err == nil {
-						err = errors.New("worker resolver returned no worker")
+	if pinnedID := intentPinnedProfileID(node); pinnedID > 0 {
+		if e.workerResolve == nil {
+			return fmt.Errorf("意图指定的 LLM 配置 #%d 不可用：pinned worker resolver unavailable", pinnedID)
+		}
+		worker, err = e.workerResolve(t, WorkerSlot{Name: owner, ProfileID: pinnedID})
+		if err != nil || worker == nil {
+			if err == nil {
+				err = errors.New("worker resolver returned no worker")
+			}
+			return fmt.Errorf("意图指定的 LLM 配置 #%d 不可用：%w", pinnedID, err)
+		}
+	}
+	if worker == nil {
+		if value, ok := e.slotPlans.Load(t.ID); ok {
+			if plan, ok := value.(map[string]int64); ok {
+				if profileID, pinned := plan[owner]; pinned && profileID > 0 {
+					if e.workerResolve == nil {
+						return fmt.Errorf("意图所属的 LLM 配置 #%d 不可用：pinned worker resolver unavailable", profileID)
 					}
-					return fmt.Errorf("意图所属的 LLM 配置 #%d 不可用：%w", profileID, err)
+					worker, err = e.workerResolve(t, WorkerSlot{Name: owner, ProfileID: profileID})
+					if err != nil || worker == nil {
+						if err == nil {
+							err = errors.New("worker resolver returned no worker")
+						}
+						return fmt.Errorf("意图所属的 LLM 配置 #%d 不可用：%w", profileID, err)
+					}
 				}
 			}
 		}

@@ -25,6 +25,17 @@ const (
 // facts use state 'confirmed', so this never collides.
 const StateOrigin = "origin"
 
+// Fact verification and retraction states (kind='fact'). Worker-recorded facts
+// with verifiable evidence default to 'confirmed'; high-impact or observed claims
+// lacking evidence are downgraded to 'unverified' at write time; the supervisor
+// can mark hallucinated or invalidated facts 'disputed' or 'retracted'.
+const (
+	StateFactConfirmed  = "confirmed"
+	StateFactUnverified = "unverified"
+	StateFactDisputed   = "disputed"
+	StateFactRetracted  = "retracted"
+)
+
 // StateIntentDeleted marks an intent the user假删除(soft delete): it drops out of
 // the frontier and graph_overview like other terminal states, but keeps its node
 // and full lineage. The delete reason lives in exploration_nodes.delete_reason.

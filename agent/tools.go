@@ -477,6 +477,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		if len(recentFacts) >= recentFactsCap {
 			break
 		}
+		if n.State == db.StateFactRetracted {
+			continue // Supervisor 已撤回的假事实不再进入规划概览，保留原节点审计
+		}
 		if hidden(n.ID) {
 			continue // 已折进 digest 且仍冷 —— 见 cold_digests
 		}
@@ -484,12 +487,21 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本事实由哪个意图产生
 		}
+		if n.State == db.StateFactUnverified || n.State == db.StateFactDisputed {
+			m["state"] = n.State
+		}
 		// confidence 带进概览：让规划者一眼看出哪条结论只是 inferred（尤其否定结论
 		// 别当铁案）；evidence 较长，留给 node_detail(id)。
 		var fp map[string]any
 		if json.Unmarshal(n.Payload, &fp) == nil {
 			if c, ok := fp["confidence"].(string); ok && c != "" {
 				m["confidence"] = c
+			}
+			if actID, ok := fp["evidence_activity_id"]; ok && actID != nil {
+				m["evidence_activity_id"] = actID
+			}
+			if note, ok := fp["asset_note"].(bool); ok && note {
+				m["asset_note"] = true
 			}
 		}
 		recentFacts = append(recentFacts, m)
@@ -1055,6 +1067,9 @@ func (t *ToolSet) addOneIntentContext(ctx context.Context, it intentItem) (int64
 		if n.Kind != db.KindFact && n.Kind != db.KindFinding {
 			return 0, fmt.Errorf("parent_id %d 是 %q 节点，不能作为意图锚点：意图只能锚在已确认的【事实(fact)/发现(finding)】上，不能挂在意图/目标/提示上；顶层全新方向请留空 parent_ids", pidv, n.Kind)
 		}
+		if n.Kind == db.KindFact && n.State == db.StateFactRetracted {
+			return 0, fmt.Errorf("parent_id %d 是已被撤回(retracted)的事实节点，不能作为新意图的锚点", pidv)
+		}
 	}
 	priority := it.Priority
 	if priority == 0 {
@@ -1327,13 +1342,55 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 // must NOT be stuffed into the asset graph via upsert_asset.
 // factItem 是 record_fact 批量/单条的一条事实。
 type factItem struct {
-	Intelligence []db.IntelligenceInput `json:"intelligence"`
-	Summary      string                 `json:"summary"`
-	Detail       string                 `json:"detail"`
-	Evidence     string                 `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
-	Confidence   string                 `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
-	IntentID     json.RawMessage        `json:"intent_id"`
-	AssetIDs     []json.RawMessage      `json:"asset_ids"`
+	Intelligence       []db.IntelligenceInput `json:"intelligence"`
+	Summary            string                 `json:"summary"`
+	Detail             string                 `json:"detail"`
+	Evidence           string                 `json:"evidence"`             // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
+	EvidenceActivityID json.RawMessage        `json:"evidence_activity_id"` // 可选：关联本任务的真实执行记录 ID，供 Supervisor/Planner 下钻原文
+	Confidence         string                 `json:"confidence"`           // observed（直接看到）| inferred（据现象推断）
+	AssetNote          bool                   `json:"asset_note"`           // 可选：标记为同资产实时共享的特征/踩坑备注，自动推送给后续同资产 Worker
+	IntentID           json.RawMessage        `json:"intent_id"`
+	AssetIDs           []json.RawMessage      `json:"asset_ids"`
+}
+
+// isHighImpactFactClaim detects assertions whose false positives most heavily
+// pollute downstream planning (e.g. claimed auth bypass, privilege access,
+// confirmed vulnerability or valid credential).
+func isHighImpactFactClaim(summary, detail string) bool {
+	text := strings.ToLower(strings.TrimSpace(summary + " " + detail))
+	if text == "" {
+		return false
+	}
+	markers := []string{
+		"绕过", "越权", "未授权", "接管", "提权", "拿到了", "获取凭据", "已登录", "验证成功", "可利用", "存在漏洞",
+		"bypass", "idor", "unauth", "unauthorized access", "privilege", "admin access", "confirmed vuln", "valid credential",
+	}
+	for _, m := range markers {
+		if strings.Contains(text, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyFactInitialState applies the deterministic write-time anti-hallucination
+// gate: observed or high-impact claims without concrete evidence or a verified
+// non-error activity record are persisted as StateFactUnverified instead of
+// StateFactConfirmed so downstream planners/supervisors treat them cautiously.
+func classifyFactInitialState(it factItem, verifiedAct *db.Activity) (state, downgradeReason string) {
+	hasEvidenceText := strings.TrimSpace(it.Evidence) != ""
+	hasVerifiedSuccessAct := verifiedAct != nil && !verifiedAct.IsError
+	if hasEvidenceText || hasVerifiedSuccessAct {
+		return db.StateFactConfirmed, ""
+	}
+	conf := strings.ToLower(strings.TrimSpace(it.Confidence))
+	if conf == "observed" {
+		return db.StateFactUnverified, "claimed observed without evidence or verified non-error activity"
+	}
+	if isHighImpactFactClaim(it.Summary, it.Detail) {
+		return db.StateFactUnverified, "high-impact claim missing verifiable evidence"
+	}
+	return db.StateFactConfirmed, ""
 }
 
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
@@ -1352,6 +1409,21 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if c := strings.TrimSpace(it.Confidence); c != "" {
 		payload["confidence"] = c
 	}
+	if it.AssetNote {
+		payload["asset_note"] = true
+	}
+	var verifiedAct *db.Activity
+	if actID := pid(it.EvidenceActivityID); actID > 0 {
+		act, err := t.ts.VerifyActivityBelongsToExploration(actID)
+		if err != nil {
+			return 0, fmt.Errorf("校验 evidence_activity_id 失败: %w", err)
+		}
+		if act == nil {
+			return 0, fmt.Errorf("evidence_activity_id %d 不存在于本任务执行记录", actID)
+		}
+		verifiedAct = act
+		payload["evidence_activity_id"] = actID
+	}
 	intent := pid(it.IntentID)
 	if intent <= 0 {
 		intent = defaultIntent
@@ -1362,8 +1434,12 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 			return 0, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
+	state, downgradeReason := classifyFactInitialState(it, verifiedAct)
+	if downgradeReason != "" {
+		payload["downgrade_reason"] = downgradeReason
+	}
 	// a fact is its OWN node kind (distinct from a vuln finding).
-	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
+	id, err := t.ts.AddNode(db.KindFact, payload, 5, state, t.worker, pidList(it.AssetIDs))
 	if err != nil {
 		return 0, err
 	}
@@ -1379,17 +1455,20 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 		"⚠️一次探索的多个观察要【汇总成一条事实】，不要拆成多条，可以合并成一条事实的就尽量用一条事实表示：summary=对本次结论的总结性一句话，detail=相关细节（可含多个具体项）。例：指纹意图→一条事实 {summary:'识别了 X 站点的技术栈与响应特征', detail:'nginx 1.25 / Vue3 / 200 / title=.. / body_len=..'}，而不是状态码、指纹、标题各记一条。一条意图通常只产出一条事实，拆太碎会让图谱无限膨胀。\n"+
 		"★facts 数组用于一次写多条【彼此不同】的结论（每条可省略 intent_id，默认用顶层 intent_id）。返回 ids 数组，与 facts 等长同序。\n"+
 		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。evidence 与 confidence 用来防止不准确的结论污染图谱：\n"+
-		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出。\n"+
+		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出；observed 或高影响声明缺少 evidence/evidence_activity_id 会自动降级为 unverified。\n"+
+		"  · asset_note=true 可将确认的同资产特征/踩坑（如 WAF 规则、HTTP 200 假阳性、真实鉴权方式）标为资产级共享备注，后续同资产 Worker 会自动收到。\n"+
 		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+
 		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。",
 		obj(map[string]any{
-			"facts":      map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
-			"intent_id":  idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
-			"detail":     str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
-			"evidence":   str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-			"confidence": str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
+			"facts":                map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/evidence_activity_id/confidence/asset_note/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"summary":              str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
+			"intent_id":            idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
+			"detail":               str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
+			"evidence":             str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
+			"evidence_activity_id": idp("可选：支撑本事实的本任务真实执行记录 id，便于 Supervisor/Planner 一键下钻原始输出"),
+			"confidence":           str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
+			"asset_note":           map[string]any{"type": "boolean", "description": "可选：若本条为同资产可复用的特征/踩坑（如 WAF、软 200 鉴权失败、特殊入口规范），设为 true 并传 asset_ids，后续同资产 Worker 将自动注入。"},
+			"asset_ids":            map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {

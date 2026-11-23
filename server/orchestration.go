@@ -64,7 +64,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 // orchestrationTools returns the cross-task tool set. Bound per-agent via the
 // tools table (default: no binding — opt-in for orchestration agents).
 func (s *Server) orchestrationTools() []actool.CoreTool {
-	return append([]actool.CoreTool{
+	base := []actool.CoreTool{
 		s.toolListTasks(),
 		s.toolChainReviewSnapshot(),
 		s.toolChainReviewPublish(),
@@ -81,7 +81,9 @@ func (s *Server) orchestrationTools() []actool.CoreTool {
 		s.toolUpdateFindingReport(),
 		s.toolGetFindingTraffic(),
 		s.toolBindFindingTraffic(),
-	}, s.findingCaseTools()...)
+	}
+	base = append(base, s.supervisorTools()...)
+	return append(base, s.findingCaseTools()...)
 }
 
 // --- schema helpers ---
@@ -523,7 +525,10 @@ func (s *Server) seedOrchestrationTools() {
 	for _, t := range s.orchestrationTools() {
 		schema, _ := json.Marshal(t.InputSchema())
 		bindings := autoAgents
-		if t.Name() == "bind_finding_traffic" || strings.Contains(t.Name(), "finding_case") || t.Name() == "search_finding_duplicates" || t.Name() == "get_finding_record" || t.Name() == "merge_finding_records" || t.Name() == "suggest_finding_merge" {
+		switch {
+		case strings.HasPrefix(t.Name(), "supervisor_") || strings.HasPrefix(t.Name(), "chain_review_"):
+			bindings = json.RawMessage(`["chain_reviewer"]`)
+		case t.Name() == "bind_finding_traffic" || strings.Contains(t.Name(), "finding_case") || t.Name() == "search_finding_duplicates" || t.Name() == "get_finding_record" || t.Name() == "merge_finding_records" || t.Name() == "suggest_finding_merge":
 			bindings = json.RawMessage(`["reporter"]`)
 		}
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, bindings)
@@ -558,9 +563,21 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedFindingTrafficTools() // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
 	s.seedFindingCaseTools()
+	s.seedSupervisorUpgrade()
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
 	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
 	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
+}
+
+// seedSupervisorUpgrade binds the native Supervisor tools to chain_reviewer on
+// existing databases once without overwriting custom user prompts.
+func (s *Server) seedSupervisorUpgrade() {
+	const flag = "supervisor_upgrade_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+	_ = s.m.pg.AddAgentToToolBinding(agent.ChainReviewerKey, supervisorToolNames())
 }
 
 // migrateReporterWorkflow repairs databases created by the short-lived

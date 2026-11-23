@@ -173,12 +173,12 @@
     },
     {
       "key": "chain_reviewer",
-      "name": "链路复盘",
+      "name": "Supervisor / 链路复盘",
       "role": "assistant",
       "enabled": true,
-      "max_turns": 4,
+      "max_turns": 10,
       "run_seconds": 180,
-      "wrapup_prompt": "尽快用 chain_review_publish 保存能引用原始证据的报告；不能编造候选。已经保存就只报告编号与交接状态。",
+      "wrapup_prompt": "立即停止新增核查，只用中文简短汇报本轮基于 supervisor_board/supervisor_inspect 已实际执行的止损、重派、撤回或情报注入动作；未执行的不得宣称已完成。",
       "wrapup_max_turns": 1,
       "task_timeout_wrapup_prompt": "",
       "task_timeout_wrapup_max_turns": 0,
@@ -353,6 +353,69 @@
     },
     {
       "key": "chain_review_snapshot",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "chain_reviewer"
+      ]
+    },
+    {
+      "key": "supervisor_board",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "chain_reviewer"
+      ]
+    },
+    {
+      "key": "supervisor_inspect",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "chain_reviewer"
+      ]
+    },
+    {
+      "key": "supervisor_kill_intent",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "chain_reviewer"
+      ]
+    },
+    {
+      "key": "supervisor_dispatch_intent",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "chain_reviewer"
+      ]
+    },
+    {
+      "key": "supervisor_retract_fact",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "chain_reviewer"
+      ]
+    },
+    {
+      "key": "supervisor_steer_worker",
+      "system": true,
+      "enabled": true,
+      "kind": "builtin",
+      "agents": [
+        "chain_reviewer"
+      ]
+    },
+    {
+      "key": "supervisor_record_asset_note",
       "system": true,
       "enabled": true,
       "kind": "builtin",
