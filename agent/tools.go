@@ -573,8 +573,8 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	if len(retractedFacts) > 0 {
 		out["retracted_facts"] = retractedFacts
 	}
-	// L1 分层探索链路视图：按主资产/分支归拢活跃意图、漏洞、近期事实与墓碑，
-	// 让规划指挥官一眼看清各条攻击线进展、探针告警和已证伪分支。
+	// L1 分层探索链路视图：按主资产/分支归拢活跃意图、漏洞、近期事实、跨资产关联与墓碑，
+	// 并为悬空高价值线索（含近期未测资产）预留固定配额，避免被老分支挤掉。
 	anchorIDs := make([]int64, 0, len(all)+len(factNodes)+len(vulnNodes))
 	for _, n := range all {
 		anchorIDs = append(anchorIDs, n.ID)
@@ -592,7 +592,63 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		anchorIDs = append(anchorIDs, n.ID)
 	}
 	nodeAnchors, _ := t.ts.NodeAnchors(anchorIDs)
-	if chain := buildLayeredChainView(all, factNodes, vulnNodes, nodeAnchors, tmByIntent); len(chain) > 0 {
+	assetMeta := map[int64]chainAssetMeta{}
+	var untestedMeta []chainAssetMeta
+	if t.as != nil && t.taskID > 0 {
+		referencedAssets := map[int64]bool{}
+		for _, aids := range nodeAnchors {
+			for _, aid := range aids {
+				if aid > 0 {
+					referencedAssets[aid] = true
+				}
+			}
+		}
+		for _, n := range all {
+			if aid := primaryAssetForNode(n.ID, n.Payload, nodeAnchors); aid > 0 {
+				referencedAssets[aid] = true
+			}
+		}
+		if !t.coverageDisabled {
+			if untested, _, err := t.as.ListUntestedAssetsWithSources(t.taskID, "", 6, 0); err == nil {
+				for _, u := range untested {
+					if u.ID > 0 {
+						referencedAssets[u.ID] = true
+						untestedMeta = append(untestedMeta, chainAssetMeta{ID: u.ID, Type: u.Type, Label: u.Label})
+					}
+				}
+			}
+		}
+		if len(referencedAssets) > 0 {
+			ids := make([]int64, 0, len(referencedAssets))
+			for aid := range referencedAssets {
+				ids = append(ids, aid)
+			}
+			if assets, err := t.as.GetByIDsInScope(t.taskID, ids); err == nil {
+				for _, a := range assets {
+					if a == nil {
+						continue
+					}
+					lbl := strings.TrimSpace(a.URL)
+					if lbl == "" {
+						lbl = strings.TrimSpace(a.Domain)
+					}
+					if lbl == "" {
+						lbl = strings.TrimSpace(a.IP)
+					}
+					if lbl == "" {
+						lbl = strings.TrimSpace(a.AppName)
+					}
+					assetMeta[a.ID] = chainAssetMeta{
+						ID:           a.ID,
+						Type:         a.Type,
+						Label:        lbl,
+						Technologies: a.Technologies,
+					}
+				}
+			}
+		}
+	}
+	if chain := buildLayeredChainView(all, factNodes, vulnNodes, edges, nodeAnchors, tmByIntent, assetMeta, untestedMeta); len(chain) > 0 {
 		out["chain_view"] = chain
 	}
 	if t.listProfiles != nil {

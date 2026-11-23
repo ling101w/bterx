@@ -40,10 +40,10 @@ func TestIntentTelemetryAlertsAndFiltering(t *testing.T) {
 	defer e.endIntentTelemetry(202)
 	_ = tmOther
 
-	// Simulate 4 repeated identical tool calls and 3 consecutive errors.
-	for i := 0; i < 4; i++ {
-		tm.observe(db.Activity{Kind: "tool_use", Tool: "Bash", Summary: "curl https://t/api"})
-		tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true})
+	// Simulate 5 identical repeated tool calls and 5 consecutive non-transient errors.
+	for i := 0; i < 5; i++ {
+		tm.observe(db.Activity{Kind: "tool_use", Tool: "Bash", Summary: "curl https://t/api", Detail: "curl -s https://t/api"})
+		tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "command not found"})
 	}
 
 	// Simulate long idle & run duration.
@@ -57,7 +57,7 @@ func TestIntentTelemetryAlertsAndFiltering(t *testing.T) {
 		t.Fatalf("unexpected filtered snapshots: %+v", snaps)
 	}
 	s := snaps[0]
-	if s.PinnedProfileID != 9 || s.ToolCalls != 4 || s.ToolErrors != 4 || s.ConsecutiveErrors != 4 || s.RepeatedToolCalls != 4 {
+	if s.PinnedProfileID != 9 || s.ToolCalls != 5 || s.ToolErrors != 5 || s.ConsecutiveErrors != 5 || s.RepeatedToolCalls != 5 {
 		t.Fatalf("unexpected telemetry counters: %+v", s)
 	}
 	alertSet := map[string]bool{}
@@ -276,20 +276,62 @@ func TestProbeObserveWakeCooldown(t *testing.T) {
 	tm := e.beginIntentTelemetry("1", 555, "work#1", 0)
 	defer e.endIntentTelemetry(555)
 
-	// Errors 1 and 2 do not wake yet.
-	for i := 0; i < 2; i++ {
-		if alerts, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "timeout"}); len(alerts) != 0 {
-			t.Fatalf("unexpected early alert on error %d: %v", i+1, alerts)
+	// 1. Long-prefix curl commands with identical first 160 chars but different URLs must NOT false-trigger loop.
+	longHeader := "curl -s -H 'Authorization: Bearer " + strings.Repeat("A", 160) + "' "
+	for i := 0; i < 6; i++ {
+		url := "https://corp.example.test/api/item/" + strconv.Itoa(i)
+		if alerts, _ := tm.observe(db.Activity{
+			Kind: "tool_use", Tool: "Bash",
+			Summary: longHeader + url,
+			Detail:  longHeader + url,
+		}); len(alerts) != 0 {
+			t.Fatalf("unexpected false-positive loop alert on distinct long curl #%d: %v", i, alerts)
 		}
 	}
-	// Error 3 triggers consecutive_errors alert immediately.
-	alerts, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "timeout"})
-	if len(alerts) == 0 || alerts[0] != "consecutive_errors" {
-		t.Fatalf("expected consecutive_errors on 3rd error, got %v", alerts)
+
+	// 2. Transient/benign errors (503, 429, grep exit 1) must NOT escalate consecutive_errors.
+	for _, msg := range []string{"HTTP 503 Service Unavailable", "429 Too Many Requests", "grep foo bar: exit status 1"} {
+		if alerts, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: msg}); len(alerts) != 0 {
+			t.Fatalf("unexpected wakeup on transient/benign error %q: %v", msg, alerts)
+		}
 	}
-	// Error 4 immediately after is suppressed by cooldown.
-	if alerts2, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "timeout"}); len(alerts2) != 0 {
+	if snap := tm.snapshot(time.Now()); snap.ConsecutiveErrors != 0 {
+		t.Fatalf("expected transient/benign errors not to bump consecutiveErrors, got %d", snap.ConsecutiveErrors)
+	}
+
+	// 3. During startup warmup (<90s), 5 errors surface passive alert in snapshot but do NOT wake Planner.
+	for i := 0; i < 5; i++ {
+		if alerts, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "syntax error"}); len(alerts) != 0 {
+			t.Fatalf("unexpected active wakeup during warmup window: %v", alerts)
+		}
+	}
+
+	// 4. After warmup window, non-transient hard error triggers consecutive_errors wakeup, then cooldown suppresses immediate repeat.
+	tm.mu.Lock()
+	tm.startedAt = time.Now().Add(-2 * time.Minute)
+	tm.mu.Unlock()
+	alerts, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "syntax error"})
+	if len(alerts) == 0 || alerts[0] != "consecutive_errors" {
+		t.Fatalf("expected consecutive_errors after warmup, got %v", alerts)
+	}
+	if alerts2, _ := tm.observe(db.Activity{Kind: "tool_result", Tool: "Bash", IsError: true, Summary: "syntax error"}); len(alerts2) != 0 {
 		t.Fatalf("expected cooldown to suppress duplicate wake, got %v", alerts2)
+	}
+}
+
+func TestProbeExactRepeatedLoopWakesImmediately(t *testing.T) {
+	e := &Engine{}
+	tm := e.beginIntentTelemetry("1", 556, "work#2", 0)
+	defer e.endIntentTelemetry(556)
+
+	for i := 0; i < 4; i++ {
+		if alerts, _ := tm.observe(db.Activity{Kind: "tool_use", Tool: "Bash", Summary: "curl -s https://t/same", Detail: "curl -s https://t/same"}); len(alerts) != 0 {
+			t.Fatalf("unexpected early loop alert at call %d: %v", i+1, alerts)
+		}
+	}
+	alerts, _ := tm.observe(db.Activity{Kind: "tool_use", Tool: "Bash", Summary: "curl -s https://t/same", Detail: "curl -s https://t/same"})
+	if len(alerts) == 0 || alerts[0] != "repeated_tool_loop" {
+		t.Fatalf("expected repeated_tool_loop on 5th identical call, got %v", alerts)
 	}
 }
 

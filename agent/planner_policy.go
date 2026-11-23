@@ -49,18 +49,24 @@ const plannerCommanderInstruction = `
 4. **同资产实时共享**：一旦确认可复用的资产级特征（WAF 触发规则、HTTP 200 软鉴权失败特征、有效测试会话/鉴权头规范、真实框架版本），立即用 record_asset_note（或 steer_work 的 also_asset_note=true）锚定到对应 asset_ids，让同资产在跑与后续 Worker 直接复用，不再重复踩坑。`
 
 type plannerRoundPolicy struct {
-	mu         sync.Mutex
-	queries    map[string]bool
-	dispatched bool
-	decision   bool
-	stopNudged bool
-	active     func() (bool, error)
-	openGoals  func() (bool, error)
-	final      bool
+	mu             sync.Mutex
+	queries        map[string]bool
+	dispatched     bool
+	decision       bool
+	stopNudged     bool
+	backlogRefused bool
+	active         func() (bool, error)
+	openGoals      func() (bool, error)
+	backlogCheck   func() []string
+	final          bool
 }
 
 func newPlannerRoundPolicy(active, goals func() (bool, error), final bool) *plannerRoundPolicy {
 	return &plannerRoundPolicy{queries: map[string]bool{}, active: active, openGoals: goals, final: final}
+}
+
+func (p *plannerRoundPolicy) setBacklogCheck(fn func() []string) {
+	p.backlogCheck = fn
 }
 
 func canonicalPlannerInput(in []byte) string {
@@ -197,6 +203,34 @@ func (p *plannerRoundPolicy) decisionTool() actool.CoreTool {
 			case "await_running", "missing_prerequisite", "insufficient_evidence", "no_supported_direction":
 			default:
 				return actool.Errorf("无效 reason_kind"), nil
+			}
+			active := false
+			if p.active != nil {
+				if v, err := p.active(); err == nil {
+					active = v
+				}
+			}
+			if a.Kind == "await_running" && !active {
+				return actool.Errorf("当前没有任何 open 或 running 意图，不能以 await_running 结束本轮；请先 add_intent 派发方向，或核对真实阻塞原因。"), nil
+			}
+			openGoals := true
+			if p.openGoals != nil {
+				if v, err := p.openGoals(); err == nil {
+					openGoals = v
+				}
+			}
+			if !p.final && !active && openGoals && p.backlogCheck != nil {
+				if backlog := p.backlogCheck(); len(backlog) > 0 {
+					p.mu.Lock()
+					alreadyRefused := p.backlogRefused
+					if !alreadyRefused {
+						p.backlogRefused = true
+					}
+					p.mu.Unlock()
+					if !alreadyRefused || len([]rune(strings.TrimSpace(a.Reason))) < 20 {
+						return actool.Errorf("目标尚未达成且仍有可推进线索，禁止偷懒早停：" + strings.Join(backlog, "；") + "。请优先挑高价值线索 add_intent（弱模型卡住的可传 pinned_profile_id 升档强模型）；若确均无法推进，请在 reason 中具体说明为何这些线索都不可行（至少20字）后再提交。"), nil
+					}
+				}
 			}
 			p.mu.Lock()
 			p.decision = true

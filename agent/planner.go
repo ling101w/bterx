@@ -398,6 +398,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// Planner keeps graph decisions and Todos; workers own commands and target I/O.
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	policy := newPlannerRoundPolicy(ts.HasActiveIntent, ts.HasOpenGoal, taskClockFrom(ctx).Final)
+	policy.setBacklogCheck(tsx.unexploredBacklogHints)
 	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), p.todoFor(ts.ID()).Tool())
 	base = append(base, policy.decisionTool())
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})

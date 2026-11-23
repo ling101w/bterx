@@ -195,12 +195,79 @@ func dedupInt64(ids []int64) []int64 {
 	return out
 }
 
+// unexploredBacklogHints inspects the live exploration and asset stores for
+// concrete unexplored work before allowing planner_decision to end an empty
+// queue round without dispatching any intent.
+func (t *ToolSet) unexploredBacklogHints() []string {
+	var hints []string
+	if t.as != nil && t.taskID > 0 && !t.coverageDisabled {
+		if untested, total, err := t.as.ListUntestedAssetsWithSources(t.taskID, "", 3, 0); err == nil && total > 0 {
+			labels := make([]string, 0, len(untested))
+			for _, u := range untested {
+				if lbl := strings.TrimSpace(u.Label); lbl != "" {
+					labels = append(labels, fmt.Sprintf("#%d(%s)", u.ID, truncateRunes(lbl, 40)))
+				}
+			}
+			sample := strings.Join(labels, "、")
+			if sample != "" {
+				hints = append(hints, fmt.Sprintf("仍有 %d 个未测资产（如 %s）", total, sample))
+			} else {
+				hints = append(hints, fmt.Sprintf("仍有 %d 个未测资产（可用 list_untested_assets 查看）", total))
+			}
+		}
+	}
+	if t.ts != nil {
+		if facts, err := t.ts.ListByKind(db.KindFact, 40); err == nil {
+			var unverifiedIDs []string
+			for _, f := range facts {
+				if f.State == db.StateFactUnverified || f.State == db.StateFactDisputed {
+					if len(unverifiedIDs) < 3 {
+						unverifiedIDs = append(unverifiedIDs, fmt.Sprintf("#%d", f.ID))
+					}
+				}
+			}
+			if len(unverifiedIDs) > 0 {
+				hints = append(hints, fmt.Sprintf("仍有待核验/存疑事实（%s）未处理", strings.Join(unverifiedIDs, "、")))
+			}
+		}
+		if intents, err := t.ts.ListByKind(db.KindIntent, 40); err == nil {
+			var retryable []string
+			for _, n := range intents {
+				if n.State != "exhausted" && n.State != "blocked" {
+					continue
+				}
+				var p map[string]any
+				_ = json.Unmarshal(n.Payload, &p)
+				if p["pinned_profile_id"] == nil && len(retryable) < 3 {
+					retryable = append(retryable, fmt.Sprintf("#%d(%s)", n.ID, n.State))
+				}
+			}
+			if len(retryable) > 0 {
+				hints = append(hints, fmt.Sprintf("仍有未升级强模型重试的耗尽/阻塞意图（%s）", strings.Join(retryable, "、")))
+			}
+		}
+	}
+	return hints
+}
+
+// chainAssetMeta carries concise asset identity for L1 chain_view display.
+type chainAssetMeta struct {
+	ID           int64
+	Type         string
+	Label        string
+	Technologies []string
+}
+
 // chainBranch is one L1 layered-blackboard entry grouped by primary asset (or
-// "global" for unanchored nodes) so the Commander sees each attack line's live
-// status, findings, alerts, unverified claims, and tombstones at a glance.
+// "global" for unanchored nodes) so the Commander sees each attack line's real
+// asset identity, exploration stage, cross-asset links, live alerts, and tombstones.
 type chainBranch struct {
 	Scope             string   `json:"scope"`
 	AssetID           int64    `json:"asset_id,omitempty"`
+	Label             string   `json:"label,omitempty"`
+	Technologies      []string `json:"technologies,omitempty"`
+	Stage             string   `json:"stage,omitempty"` // untested | recon_only | active | finding | stalled
+	RelatedAssets     []int64  `json:"related_assets,omitempty"`
 	ActiveIntents     []string `json:"active_intents,omitempty"`
 	Findings          []string `json:"findings,omitempty"`
 	RecentFacts       []string `json:"recent_facts,omitempty"`
@@ -208,25 +275,37 @@ type chainBranch struct {
 	AssetNotes        int      `json:"asset_notes,omitempty"`
 	HasAlerts         bool     `json:"has_alerts,omitempty"`
 	HasUnverifiedFact bool     `json:"has_unverified_fact,omitempty"`
+	latestNodeID      int64
 	priorityScore     int
 }
 
-func buildLayeredChainView(intents, facts, findings []*db.Node, anchors map[int64][]int64, tmByIntent map[int64]IntentTelemetryInfo) []chainBranch {
-	branches := map[string]*chainBranch{}
-	getBranch := func(nodeID int64, payload json.RawMessage) *chainBranch {
-		var aid int64
-		if ids := anchors[nodeID]; len(ids) > 0 {
-			aid = ids[0]
-		} else {
-			var p struct {
-				AssetIDs []json.RawMessage `json:"asset_ids"`
-			}
-			if json.Unmarshal(payload, &p) == nil {
-				if parsed := pidList(p.AssetIDs); len(parsed) > 0 {
-					aid = parsed[0]
-				}
-			}
+func primaryAssetForNode(nodeID int64, payload json.RawMessage, anchors map[int64][]int64) int64 {
+	if ids := anchors[nodeID]; len(ids) > 0 {
+		return ids[0]
+	}
+	var p struct {
+		AssetIDs []json.RawMessage `json:"asset_ids"`
+	}
+	if json.Unmarshal(payload, &p) == nil {
+		if parsed := pidList(p.AssetIDs); len(parsed) > 0 {
+			return parsed[0]
 		}
+	}
+	return 0
+}
+
+func buildLayeredChainView(
+	intents, facts, findings []*db.Node,
+	edges []db.Edge,
+	anchors map[int64][]int64,
+	tmByIntent map[int64]IntentTelemetryInfo,
+	assetMeta map[int64]chainAssetMeta,
+	untestedAssets []chainAssetMeta,
+) []chainBranch {
+	branches := map[string]*chainBranch{}
+	nodeAsset := map[int64]int64{}
+
+	ensureBranch := func(aid int64) *chainBranch {
 		key := "global"
 		if aid > 0 {
 			key = fmt.Sprintf("asset:%d", aid)
@@ -234,7 +313,28 @@ func buildLayeredChainView(intents, facts, findings []*db.Node, anchors map[int6
 		b := branches[key]
 		if b == nil {
 			b = &chainBranch{Scope: key, AssetID: aid}
+			if aid > 0 {
+				if meta, ok := assetMeta[aid]; ok {
+					b.Label = truncateRunes(meta.Label, 80)
+					if len(meta.Technologies) > 4 {
+						b.Technologies = meta.Technologies[:4]
+					} else if len(meta.Technologies) > 0 {
+						b.Technologies = meta.Technologies
+					}
+				}
+			}
 			branches[key] = b
+		}
+		return b
+	}
+	getBranch := func(n *db.Node) *chainBranch {
+		aid := primaryAssetForNode(n.ID, n.Payload, anchors)
+		if aid > 0 {
+			nodeAsset[n.ID] = aid
+		}
+		b := ensureBranch(aid)
+		if n.ID > b.latestNodeID {
+			b.latestNodeID = n.ID
 		}
 		return b
 	}
@@ -252,11 +352,11 @@ func buildLayeredChainView(intents, facts, findings []*db.Node, anchors map[int6
 		if n == nil {
 			continue
 		}
-		b := getBranch(n.ID, n.Payload)
-		sm := truncateRunes(payloadStr(n.Payload, "summary"), 80)
+		b := getBranch(n)
+		sm := truncateRunes(payloadStr(n.Payload, "summary"), 72)
 		switch n.State {
 		case "running", "open":
-			if len(b.ActiveIntents) < 4 {
+			if len(b.ActiveIntents) < 3 {
 				tag := n.State
 				var meta map[string]any
 				_ = json.Unmarshal(n.Payload, &meta)
@@ -279,7 +379,7 @@ func buildLayeredChainView(intents, facts, findings []*db.Node, anchors map[int6
 				}
 				line := fmt.Sprintf("#%d [%s] %s", n.ID, n.State, sm)
 				if why != "" {
-					line += " (" + truncateRunes(why, 60) + ")"
+					line += " (" + truncateRunes(why, 56) + ")"
 				}
 				b.Tombstones = append(b.Tombstones, line)
 				b.priorityScore += 2
@@ -291,9 +391,9 @@ func buildLayeredChainView(intents, facts, findings []*db.Node, anchors map[int6
 		if n == nil {
 			continue
 		}
-		b := getBranch(n.ID, n.Payload)
-		if len(b.Findings) < 4 {
-			b.Findings = append(b.Findings, fmt.Sprintf("#%d %s", n.ID, truncateRunes(payloadStr(n.Payload, "summary"), 80)))
+		b := getBranch(n)
+		if len(b.Findings) < 3 {
+			b.Findings = append(b.Findings, fmt.Sprintf("#%d %s", n.ID, truncateRunes(payloadStr(n.Payload, "summary"), 72)))
 			b.priorityScore += 10
 		}
 	}
@@ -302,8 +402,8 @@ func buildLayeredChainView(intents, facts, findings []*db.Node, anchors map[int6
 		if n == nil || n.State == db.StateOrigin {
 			continue
 		}
-		b := getBranch(n.ID, n.Payload)
-		sm := truncateRunes(payloadStr(n.Payload, "summary"), 80)
+		b := getBranch(n)
+		sm := truncateRunes(payloadStr(n.Payload, "summary"), 72)
 		if n.State == db.StateFactRetracted {
 			if len(b.Tombstones) < 3 {
 				var fp map[string]any
@@ -314,7 +414,7 @@ func buildLayeredChainView(intents, facts, findings []*db.Node, anchors map[int6
 				}
 				line := fmt.Sprintf("#%d [retracted_fact] %s", n.ID, sm)
 				if why != "" {
-					line += " (" + truncateRunes(why, 60) + ")"
+					line += " (" + truncateRunes(why, 56) + ")"
 				}
 				b.Tombstones = append(b.Tombstones, line)
 			}
@@ -330,7 +430,7 @@ func buildLayeredChainView(intents, facts, findings []*db.Node, anchors map[int6
 			b.HasUnverifiedFact = true
 			b.priorityScore += 8
 		}
-		if len(b.RecentFacts) < 4 {
+		if len(b.RecentFacts) < 3 {
 			tag := n.State
 			if isNote {
 				tag += "|note"
@@ -340,21 +440,145 @@ func buildLayeredChainView(intents, facts, findings []*db.Node, anchors map[int6
 		}
 	}
 
-	list := make([]chainBranch, 0, len(branches))
-	for _, b := range branches {
-		if len(b.ActiveIntents) == 0 && len(b.Findings) == 0 && len(b.RecentFacts) == 0 && len(b.Tombstones) == 0 {
+	// Surface recently discovered untested assets directly as dangling branches so
+	// newly enumerated services/endpoints are visible without guessing DSL queries.
+	for _, ua := range untestedAssets {
+		if ua.ID <= 0 {
 			continue
 		}
-		list = append(list, *b)
-	}
-	sort.Slice(list, func(i, j int) bool {
-		if list[i].priorityScore != list[j].priorityScore {
-			return list[i].priorityScore > list[j].priorityScore
+		key := fmt.Sprintf("asset:%d", ua.ID)
+		if _, exists := branches[key]; exists {
+			continue
 		}
-		return list[i].Scope < list[j].Scope
-	})
-	if len(list) > 12 {
-		list = list[:12]
+		b := ensureBranch(ua.ID)
+		if b.Label == "" {
+			b.Label = truncateRunes(ua.Label, 80)
+		}
+		if len(b.Technologies) == 0 && len(ua.Technologies) > 0 {
+			if len(ua.Technologies) > 4 {
+				b.Technologies = ua.Technologies[:4]
+			} else {
+				b.Technologies = ua.Technologies
+			}
+		}
+		b.Stage = "untested"
 	}
-	return list
+
+	// Preserve cross-asset lineage via derived_from / yields edges so multi-asset
+	// chains (e.g. subdomain A cred leak -> admin B login) stay visibly linked.
+	relSeen := map[string]map[int64]bool{}
+	addRel := func(scope string, otherAsset int64) {
+		if otherAsset <= 0 {
+			return
+		}
+		b := branches[scope]
+		if b == nil || b.AssetID == otherAsset {
+			return
+		}
+		if relSeen[scope] == nil {
+			relSeen[scope] = map[int64]bool{}
+		}
+		if relSeen[scope][otherAsset] || len(b.RelatedAssets) >= 4 {
+			return
+		}
+		relSeen[scope][otherAsset] = true
+		b.RelatedAssets = append(b.RelatedAssets, otherAsset)
+	}
+	for _, e := range edges {
+		if e.Rel != db.RelDerivedFrom && e.Rel != db.RelYields {
+			continue
+		}
+		srcA, dstA := nodeAsset[e.From], nodeAsset[e.To]
+		if srcA > 0 && dstA > 0 && srcA != dstA {
+			addRel(fmt.Sprintf("asset:%d", srcA), dstA)
+			addRel(fmt.Sprintf("asset:%d", dstA), srcA)
+		}
+	}
+
+	// Classify exploration stage and split into 3 quota-reserved buckets (max 12):
+	//   Bucket A (up to 4): Urgent branches (probe alerts or unverified/disputed facts)
+	//   Bucket B (up to 4): Dangling leads (0 active intents, with fresh facts/findings or untested asset)
+	//   Bucket C (fill to 12): Remaining active/recent branches
+	var urgent, dangling, rest []*chainBranch
+	for _, b := range branches {
+		if b.Stage == "" {
+			switch {
+			case len(b.Findings) > 0:
+				b.Stage = "finding"
+			case len(b.ActiveIntents) > 0:
+				b.Stage = "active"
+			case len(b.RecentFacts) > 0:
+				b.Stage = "recon_only"
+			case len(b.Tombstones) > 0:
+				b.Stage = "stalled"
+			default:
+				continue
+			}
+		}
+		switch {
+		case b.HasAlerts || b.HasUnverifiedFact:
+			urgent = append(urgent, b)
+		case len(b.ActiveIntents) == 0 && (b.Stage == "untested" || b.Stage == "recon_only" || b.Stage == "finding"):
+			dangling = append(dangling, b)
+		default:
+			rest = append(rest, b)
+		}
+	}
+
+	sortByUrgency := func(s []*chainBranch) {
+		sort.Slice(s, func(i, j int) bool {
+			if s[i].HasAlerts != s[j].HasAlerts {
+				return s[i].HasAlerts
+			}
+			if s[i].priorityScore != s[j].priorityScore {
+				return s[i].priorityScore > s[j].priorityScore
+			}
+			if s[i].latestNodeID != s[j].latestNodeID {
+				return s[i].latestNodeID > s[j].latestNodeID
+			}
+			return s[i].Scope < s[j].Scope
+		})
+	}
+	sortByRecency := func(s []*chainBranch) {
+		sort.Slice(s, func(i, j int) bool {
+			if s[i].latestNodeID != s[j].latestNodeID {
+				return s[i].latestNodeID > s[j].latestNodeID
+			}
+			if s[i].priorityScore != s[j].priorityScore {
+				return s[i].priorityScore > s[j].priorityScore
+			}
+			return s[i].Scope < s[j].Scope
+		})
+	}
+	sortByUrgency(urgent)
+	sortByRecency(dangling)
+	sortByRecency(rest)
+
+	const totalCap = 12
+	const urgentQuota = 4
+	const danglingQuota = 4
+
+	selected := make([]chainBranch, 0, totalCap)
+	seen := map[string]bool{}
+	take := func(src []*chainBranch, maxN int) {
+		taken := 0
+		for _, b := range src {
+			if len(selected) >= totalCap || taken >= maxN {
+				break
+			}
+			if seen[b.Scope] {
+				continue
+			}
+			seen[b.Scope] = true
+			selected = append(selected, *b)
+			taken++
+		}
+	}
+	take(urgent, urgentQuota)
+	take(dangling, danglingQuota)
+	take(rest, totalCap)
+	// Fill any leftover capacity from overflow urgent/dangling items.
+	take(urgent, totalCap)
+	take(dangling, totalCap)
+	return selected
 }

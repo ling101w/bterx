@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -12,11 +14,13 @@ import (
 )
 
 const (
-	probeIdleStallThreshold    = 5 * time.Minute
-	probeLongRunNoOutputWindow = 10 * time.Minute
-	probeConsecutiveErrorLimit = 3
-	probeRepeatedToolCallLimit = 4
-	probeAlertWakeCooldown     = 3 * time.Minute
+	probeIdleStallThreshold     = 5 * time.Minute
+	probeLongRunNoOutputWindow  = 10 * time.Minute
+	probeSoftErrorStreakLimit   = 3                // passive indicator on overview only (does not wake Planner)
+	probeHardConsecutiveErrCap  = 5                // active NotifyProbeAlert wakeup threshold
+	probeRepeatedToolCallLimit  = 5                // exact full-payload SHA-256 repeat threshold
+	probeMinWakeAgeForErrors    = 90 * time.Second // ignore early startup command-typo bursts
+	probeAlertWakeCooldown      = 3 * time.Minute
 )
 
 // intentTelemetry tracks zero-cost in-memory runtime health metrics for one
@@ -34,14 +38,14 @@ type intentTelemetry struct {
 	toolCalls         int
 	toolErrors        int
 	consecutiveErrors int
-	lastToolSig       string
+	lastToolHash      string
 	repeatedToolCalls int
 	factsWritten      int
 	findingsWritten   int
 }
 
 // IntentTelemetrySnapshot is a lock-free point-in-time view exposed on the
-// Supervisor board.
+// Supervisor board and Planner overview.
 type IntentTelemetrySnapshot struct {
 	TaskID            string   `json:"task_id"`
 	IntentID          int64    `json:"intent_id"`
@@ -95,9 +99,45 @@ func (e *Engine) endIntentTelemetry(intentID int64) {
 	e.telemetry.Delete(intentID)
 }
 
+// toolCallFingerprint hashes the full tool name, summary, and detail so long
+// commands sharing a common header/JWT prefix never collide as false repeats.
+func toolCallFingerprint(tool, summary, detail string) string {
+	tool = strings.TrimSpace(tool)
+	summary = strings.TrimSpace(summary)
+	detail = strings.TrimSpace(detail)
+	if tool == "" && summary == "" && detail == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(tool + "\x00" + summary + "\x00" + detail))
+	return hex.EncodeToString(sum[:12])
+}
+
+// isTransientOrBenignToolError filters out temporary network/rate-limit jitter
+// and benign grep exit-1 no-match errors so they don't trip error-streak alarms.
+func isTransientOrBenignToolError(tool, summary, detail string) bool {
+	text := strings.ToLower(summary + " " + detail)
+	transientMarkers := []string{
+		"502 bad gateway", "503 service unavailable", "504 gateway timeout",
+		"429 too many requests", "rate limit", "connection reset by peer",
+		"tls handshake timeout", "i/o timeout", "temporary failure in name resolution",
+		"eof", "context deadline exceeded",
+	}
+	for _, m := range transientMarkers {
+		if strings.Contains(text, m) {
+			return true
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(tool), "Bash") &&
+		strings.Contains(text, "exit status 1") &&
+		(strings.Contains(text, "grep ") || strings.Contains(text, "rg ")) {
+		return true
+	}
+	return false
+}
+
 // observe updates in-memory telemetry for one emitted activity and returns
-// immediate anomaly alerts (rate-limited by probeAlertWakeCooldown) when the
-// Task Commander should be woken proactively.
+// immediate high-confidence anomaly alerts (rate-limited by probeAlertWakeCooldown)
+// when the Task Commander should be woken proactively.
 func (tm *intentTelemetry) observe(r db.Activity) (alerts []string, detail string) {
 	if tm == nil {
 		return nil, ""
@@ -109,17 +149,19 @@ func (tm *intentTelemetry) observe(r db.Activity) (alerts []string, detail strin
 	switch r.Kind {
 	case "tool_use":
 		tm.toolCalls++
-		sig := strings.TrimSpace(r.Tool) + "|" + preview(strings.TrimSpace(r.Summary), 120)
-		if sig != "|" && sig == tm.lastToolSig {
+		hash := toolCallFingerprint(r.Tool, r.Summary, r.Detail)
+		if hash != "" && hash == tm.lastToolHash {
 			tm.repeatedToolCalls++
 		} else {
-			tm.lastToolSig = sig
+			tm.lastToolHash = hash
 			tm.repeatedToolCalls = 1
 		}
 	case "tool_result":
 		if r.IsError {
 			tm.toolErrors++
-			tm.consecutiveErrors++
+			if !isTransientOrBenignToolError(r.Tool, r.Summary, r.Detail) {
+				tm.consecutiveErrors++
+			}
 		} else {
 			tm.consecutiveErrors = 0
 			switch r.Tool {
@@ -130,11 +172,14 @@ func (tm *intentTelemetry) observe(r db.Activity) (alerts []string, detail strin
 			}
 		}
 	}
-	if tm.consecutiveErrors >= probeConsecutiveErrorLimit {
-		alerts = append(alerts, "consecutive_errors")
-	}
+	// Tiered active wakeup:
+	// 1) Exact identical tool call repeated >= 5 times (guaranteed real loop).
+	// 2) >= 5 consecutive non-transient errors after the initial warmup window.
 	if tm.repeatedToolCalls >= probeRepeatedToolCallLimit {
 		alerts = append(alerts, "repeated_tool_loop")
+	}
+	if tm.consecutiveErrors >= probeHardConsecutiveErrCap && now.Sub(tm.startedAt) >= probeMinWakeAgeForErrors {
+		alerts = append(alerts, "consecutive_errors")
 	}
 	if len(alerts) == 0 {
 		return nil, ""
@@ -162,8 +207,10 @@ func (tm *intentTelemetry) snapshot(now time.Time) IntentTelemetrySnapshot {
 	if idleDur >= probeIdleStallThreshold {
 		alerts = append(alerts, "idle_stall")
 	}
-	if tm.consecutiveErrors >= probeConsecutiveErrorLimit {
+	if tm.consecutiveErrors >= probeHardConsecutiveErrCap {
 		alerts = append(alerts, "consecutive_errors")
+	} else if tm.consecutiveErrors >= probeSoftErrorStreakLimit {
+		alerts = append(alerts, "error_streak")
 	}
 	if tm.repeatedToolCalls >= probeRepeatedToolCallLimit {
 		alerts = append(alerts, "repeated_tool_loop")
@@ -233,7 +280,7 @@ func (e *Engine) RunningIntentTelemetryForPlanner(taskID string) []agent.IntentT
 }
 
 // resolveWorkerForIntent returns the pinned worker when an intent explicitly
-// carries a Supervisor-assigned pinned_profile_id; otherwise it returns fallback.
+// carries a Supervisor/Commander-assigned pinned_profile_id; otherwise fallback.
 func (e *Engine) resolveWorkerForIntent(t *Task, slotName string, intent *db.Node, fallback *agent.Worker) (*agent.Worker, int64) {
 	pinnedID := intentPinnedProfileID(intent)
 	if pinnedID <= 0 || e.workerResolve == nil {

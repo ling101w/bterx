@@ -5,9 +5,9 @@
 ## 1. 为什么合体（单任务唯一指挥官）
 
 - **零双头冲突**：同一大脑统筹派发（`add_intent`）、实时纠偏（`steer_work`）、止损（`kill_work`）与撤回（`retract_fact`），不会出现“督战刚杀、规划又重派”的拉锯。
-- **事件驱动秒级止损**：Go 引擎层内置零成本内存探针（`server/supervisor_probe.go`），在检测到 `consecutive_errors >= 3` 或 `repeated_tool_loop >= 4` 时（带 3 分钟冷却）立即通过 `Task.NotifyProbeAlert` 唤醒 Planner，无需干等 15 分钟定时复盘。
-- **Sapper 式分层黑板 + 墓碑机制**：`graph_overview` 新增 L1 `chain_view`（按主资产/分支归拢活跃意图、漏洞、近期事实、探针告警与墓碑），并显式暴露 `recent_stopped_intents`（带 `stop_reason`）与 `retracted_facts`，彻底解决截断窗口导致重复派活的问题。
-- **与 `planner_decision` 对齐**：缺前提或已知方向全部证伪时允许诚实调用 `planner_decision` 等待，不再逼 Planner 凑数派发无意义意图。
+- **事件驱动分级止损探针**：Go 引擎层内置零成本内存探针（`server/supervisor_probe.go`），使用完整参数 SHA-256 哈希防长命令前缀误判，并自动忽略 502/503/429/超时等瞬态抖动及 `grep` exit 1；3~4 次连错仅作为被动指标 `error_streak` 展示不打断，只有**完全一致调用连续 ≥5 次（`repeated_tool_loop`）**或**过 90 秒预热期后连续 ≥5 次非瞬态硬错误（`consecutive_errors`）**才带 3 分钟冷却通过 `Task.NotifyProbeAlert` 主动唤醒 Planner。
+- **Sapper 式分层黑板 + 悬空线索配额 + 墓碑机制**：`graph_overview` 新增 L1 `chain_view`（按主资产展示真实 `label`/技术栈、`stage` 探索深度、`related_assets` 跨资产血缘、探针告警与墓碑），并采用三桶配额（告警/待核验 ≤4、**悬空线索/未测资产固定预留 ≤4**、近期活跃补足至 12），防止新扫出的高价值入口被老分支挤出视野；同时显式保留 `recent_stopped_intents` 与 `retracted_facts` 墓碑。
+- **防 Benchmark 偷懒早停**：当目标未达成且队列为空时，`planner_decision` 会校验是否仍有未测资产、待核验事实或未升级强模型重试的 `exhausted/blocked` 意图；存在具体待推进线索时首轮直接拒绝早停，避免无人值守跑分中空等心跳。
 
 ## 2. Task Commander（Planner）新增能力
 
