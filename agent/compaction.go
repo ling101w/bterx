@@ -40,9 +40,10 @@ type Compactor struct {
 	cooldown time.Duration // min gap between compactions per task (§7 60s)
 	maxDur   time.Duration // hard cap on one background compaction
 
-	mu      sync.Mutex
-	running map[int64]bool
-	lastRun map[int64]time.Time
+	mu           sync.Mutex
+	running      map[int64]bool
+	lastRun      map[int64]time.Time
+	minMaxTokens int // learned output budget floor for always-thinking models (0 = default)
 }
 
 // NewCompactor builds a compactor. prov/model are used for the §4 body LLM call
@@ -179,6 +180,9 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
 	for _, b := range blocks {
+		if ctx.Err() != nil {
+			return
+		}
 		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil))
 	}
 	// A minor may have pushed the segment count over M → merge in the same run.
@@ -245,6 +249,9 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
 	}
 	for _, b := range toCreate {
+		if ctx.Err() != nil {
+			return
+		}
 		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active))
 	}
 }
@@ -509,24 +516,114 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 	return sb.String()
 }
 
+// compactionMaxTokensLadder defines the output-token budgets tried by compress.
+// Thinking is requested as "disabled", but always-thinking models and gateways
+// that default omitted reasoning effort to high still spend reasoning tokens out
+// of the same max_output_tokens cap. Starting at 4096 keeps normal summaries
+// cheap (models stop early at end_turn) while letting reasoning models finish on
+// the first attempt; if reasoning still exhausts the cap, compress escalates up
+// the ladder and remembers the floor up to compactionAdaptiveFloorCap.
+var compactionMaxTokensLadder = []int{4096, 8192, 16384}
+
+const compactionAdaptiveFloorCap = 8192
+
+func (c *Compactor) compressionBudgets() []int {
+	c.mu.Lock()
+	floor := c.minMaxTokens
+	c.mu.Unlock()
+	var out []int
+	for _, b := range compactionMaxTokensLadder {
+		if b >= floor {
+			out = append(out, b)
+		}
+	}
+	if len(out) == 0 {
+		return compactionMaxTokensLadder[len(compactionMaxTokensLadder)-1:]
+	}
+	return out
+}
+
+func (c *Compactor) rememberBudgetFloor(budget int) {
+	if budget > compactionAdaptiveFloorCap {
+		budget = compactionAdaptiveFloorCap
+	}
+	c.mu.Lock()
+	if budget > c.minMaxTokens {
+		c.minMaxTokens = budget
+	}
+	c.mu.Unlock()
+}
+
+func messageHasThinking(m llm.Message) bool {
+	for _, blk := range m.Content {
+		if blk.Type == llm.BlockThinking && strings.TrimSpace(blk.Thinking) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // compress runs the §4 body LLM call on one block. Uses the same model the agent
-// runs on; thinking disabled (a pure summarization step).
+// runs on; thinking is requested as "disabled", with automatic MaxTokens
+// escalation when an always-thinking model or gateway spends the budget on
+// reasoning tokens before finishing the visible summary.
 func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
-	req := llm.CompletionRequest{
-		System:    []string{compressionSystemPrompt},
-		Messages:  []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
-		MaxTokens: 1500,
-		Thinking:  "disabled",
+	userInput := buildCompressionInput(g, b, nodeByID)
+	budgets := c.compressionBudgets()
+	var lastPartial string
+	var lastStop string
+	var lastMaxTokens int
+	var lastHadThinking bool
+
+	for i, maxTok := range budgets {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		req := llm.CompletionRequest{
+			System:    []string{compressionSystemPrompt},
+			Messages:  []llm.Message{llm.UserText(userInput)},
+			MaxTokens: maxTok,
+			Thinking:  "disabled",
+		}
+		msg, stopReason, _, err := c.prov.Complete(ctx, req)
+		if err != nil {
+			if lastPartial != "" && ctx.Err() == nil {
+				return lastPartial, nil
+			}
+			return "", err
+		}
+		body := strings.TrimSpace(msg.Text())
+		hadThinking := messageHasThinking(msg)
+		truncated := stopReason == "max_tokens"
+		lastStop = stopReason
+		lastMaxTokens = maxTok
+		lastHadThinking = hadThinking
+
+		if body != "" && !(truncated && hadThinking && i+1 < len(budgets)) {
+			if i > 0 {
+				c.rememberBudgetFloor(maxTok)
+			}
+			return body, nil
+		}
+		if body != "" {
+			// Thinking consumed most of the budget and truncated the visible body;
+			// retain it as fallback in case the escalated retry hits a limit error.
+			lastPartial = body
+		}
+		// Only escalate when output tokens were plausibly exhausted by reasoning or
+		// truncation; a normal empty end_turn without thinking won't benefit from
+		// a higher cap.
+		canEscalate := i+1 < len(budgets) && (truncated || hadThinking)
+		if !canEscalate {
+			break
+		}
+		log.Printf("[compaction] escalate block=%v max_tokens %d->%d (stop=%q thinking=%v body_len=%d)",
+			b.Members, maxTok, budgets[i+1], stopReason, hadThinking, len(body))
 	}
-	msg, _, _, err := c.prov.Complete(ctx, req)
-	if err != nil {
-		return "", err
+	if lastPartial != "" {
+		return lastPartial, nil
 	}
-	body := strings.TrimSpace(msg.Text())
-	if body == "" {
-		return "", fmt.Errorf("empty body from model")
-	}
-	return body, nil
+	return "", fmt.Errorf("empty body from model (stop=%q max_tokens=%d thinking=%v)", lastStop, lastMaxTokens, lastHadThinking)
 }
 
 // compressionSystemPrompt is the §4 body prompt.
@@ -545,4 +642,4 @@ const compressionSystemPrompt = `你在压缩一组【彼此关联】的探索�
 5. 正向陈述、只写输入里有的：不脑补、不引入输入中没有的判断。
 6. 长度随内容自适应：结论少就短，多且互不相同就写够——但整体显著短于所有输入 summary 的总和。
 
-只输出 body 正文本身。`
+只输出 body 正文本身，直接给出精炼结论，不要展开长思考或添加多余前后缀。`
