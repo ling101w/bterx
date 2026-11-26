@@ -55,11 +55,15 @@ func (s *Server) wireInterceptReviewer() {
 				return intercept.Decision{ProfileID: profileID}, fmt.Errorf("Jev 判定模型未设置 API Key")
 			}
 			ctx = llmrec.WithWorker(ctx, judgeWorkerLane)
+			judgeCfg := s.m.interceptor.GetJudgeConfig()
 			started := time.Now()
 			decision, usage, reviewErr := (jev.Config{
 				BaseURL: profile.BaseURL, APIKey: profile.APIKey, Model: profile.Model, Proxy: profile.Proxy,
-			}).ReviewWithUsage(ctx, input, prompt, s.m.interceptor.GetJudgeConfig().ConfidenceThreshold, profileID)
+			}).ReviewWithUsage(ctx, input, prompt, judgeCfg.ConfidenceThreshold, profileID)
 			s.recordJevJudgeUsage(ctx, profile, usage, started, reviewErr)
+			if secDecision, ok := s.maybeSecondaryLLMReview(ctx, profileID, judgeCfg.SecondaryProfileID, prompt, input, decision, reviewErr); ok {
+				return secDecision, nil
+			}
 			return decision, reviewErr
 		}
 		prov, _, ok := s.providerForProfile(profileID)
@@ -79,6 +83,58 @@ func (s *Server) wireInterceptReviewer() {
 		}
 		return intercept.Decision{Action: v.Action, Message: v.Reason, ProfileID: profileID}, nil
 	})
+}
+
+// jevHighConfidenceDenyFloor separates obvious destructive denials (handled in
+// ~150ms by System 1 Jev with zero LLM cost) from borderline denials that
+// benefit from a fast System 2 LLM semantic check.
+const jevHighConfidenceDenyFloor = 0.80
+
+// shouldEscalateJevToSecondary reports whether a System 1 Jev outcome should be
+// escalated to the optional System 2 LLM judge. Clear allows and high-confidence
+// denies stay fast in System 1; ask verdicts (including low-confidence or >24KB
+// truncated scripts), borderline denies (<0.80), and Jev transport errors escalate.
+func shouldEscalateJevToSecondary(decision intercept.Decision, reviewErr error) (bool, string) {
+	if reviewErr != nil {
+		return true, "Jev 异常"
+	}
+	if decision.Action == "ask" {
+		return true, "Jev 存疑/截断"
+	}
+	if decision.Action == "deny" && decision.Confidence < jevHighConfidenceDenyFloor {
+		return true, "Jev 边界拦截复核"
+	}
+	return false, ""
+}
+
+func (s *Server) maybeSecondaryLLMReview(ctx context.Context, primaryID, secondaryID int64, prompt string, input intercept.ReviewInput, primary intercept.Decision, primaryErr error) (intercept.Decision, bool) {
+	if secondaryID <= 0 || secondaryID == primaryID || s == nil || s.m == nil || s.m.pg == nil {
+		return intercept.Decision{}, false
+	}
+	escalate, reason := shouldEscalateJevToSecondary(primary, primaryErr)
+	if !escalate {
+		return intercept.Decision{}, false
+	}
+	secProf, err := s.m.pg.ProfileByID(secondaryID)
+	if err != nil || secProf == nil || secProf.Format == "jev" {
+		return intercept.Decision{}, false
+	}
+	prov, _, ok := s.providerForProfile(secondaryID)
+	if !ok {
+		return intercept.Decision{}, false
+	}
+	text, err := reviewCompletion(ctx, prov, prompt, input)
+	if err != nil {
+		log.Printf("[intercept-cascade] secondary profile #%d failed after %s: %v", secondaryID, reason, err)
+		return intercept.Decision{}, false
+	}
+	v := intercept.ParseVerdict(text)
+	if v.Action == "" {
+		log.Printf("[intercept-cascade] secondary profile #%d returned unparseable verdict after %s", secondaryID, reason)
+		return intercept.Decision{}, false
+	}
+	msg := fmt.Sprintf("[Jev初筛→LLM二审(%s)] %s", reason, v.Reason)
+	return intercept.Decision{Action: v.Action, ProfileID: secondaryID, Message: msg}, true
 }
 
 func (s *Server) recordJevJudgeUsage(ctx context.Context, profile *db.LLMProfile, usage jev.Usage, started time.Time, callErr error) {
@@ -512,6 +568,14 @@ func (s *Server) interceptSetJudgeConfig(w http.ResponseWriter, r *http.Request)
 		req.ConfidenceThreshold = 0.55
 	} else if req.ConfidenceThreshold < 0 || req.ConfidenceThreshold > 1 {
 		writeErr(w, 400, "confidence_threshold 必须在 0 到 1 之间")
+		return
+	}
+	if _, present := fields["secondary_profile_id"]; !present {
+		if s.m != nil && s.m.interceptor != nil {
+			req.SecondaryProfileID = s.m.interceptor.GetJudgeConfig().SecondaryProfileID
+		}
+	} else if req.SecondaryProfileID < 0 {
+		writeErr(w, 400, "secondary_profile_id 不能为负数")
 		return
 	}
 	switch req.FailAction {

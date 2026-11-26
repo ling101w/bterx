@@ -91,6 +91,8 @@ type ToolSet struct {
 	// L0 Playbook storage roots (wired by Planner for update_playbook).
 	playbookWorkDir string
 	playbookTaskDir string
+	// Per-intent bounded 1-level sub-worker delegation (wired by Worker).
+	subtaskRunner SubtaskRunner
 	// enrich, if set, receives async auto-completion triggers (DNS resolve for a
 	// domain, HTTP probe for a site). nil = no engine enrichment.
 	enrich EnrichTrigger

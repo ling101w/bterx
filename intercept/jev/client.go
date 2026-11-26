@@ -386,7 +386,7 @@ func DecisionFromResponse(resp Response, threshold float64, profileID int64) (in
 	if a.Confidence < threshold {
 		choice = "ask"
 	}
-	return intercept.Decision{Action: choice, ProfileID: profileID, Message: FormatMessage(choice, a.Confidence, a.Probabilities)}, nil
+	return intercept.Decision{Action: choice, Confidence: a.Confidence, ProfileID: profileID, Message: FormatMessage(choice, a.Confidence, a.Probabilities)}, nil
 }
 
 func FormatMessage(choice string, confidence float64, probabilities map[string]float64) string {

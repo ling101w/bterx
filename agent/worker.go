@@ -76,6 +76,9 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// subtaskProvFn resolves an optional fast/cheap provider for delegate_subtask
+	// 1-level sub-workers so heavy side-jobs do not burn flagship model quota.
+	subtaskProvFn func() (llm.Provider, string)
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -258,7 +261,8 @@ func artifactSpec(dir string) string {
 // by the engine (ensureRunDir), so it just writes relative paths there — no manual
 // mkdir, no cross-worker name collisions.
 func workerArtifactSpec(runDir string) string {
-	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。"
+	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。" +
+		"\n**专项副手（delegate_subtask）**：遇到极占上下文的脏活（大型 JS bundle 逆向、海量日志/源码检索、协议签名提取等）时，可调用 delegate_subtask 同步委派 1 层短命副手（独立上下文、同目录、≤5 分钟、每意图限 3 次），拿回精炼结论再由你复核落库。"
 }
 
 // ensureRunDir builds and creates an agent's working directory under base:
@@ -399,6 +403,16 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx.SetOwnerNode(intent.ID)         // assets this worker discovers anchor to its intent → visible to the task
 	tsx.SetEnrich(enr)                  // async DNS/HTTP auto-completion for assets this worker writes
 	tsx.SetNotifyFinding(notifyFinding) // report_finding 落库时当场唤醒 planner，带上「哪个意图+finding」
+	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
+	proxyAddr := w.proxyAddr
+	if w.proxyAddrFn != nil {
+		proxyAddr = w.proxyAddrFn()
+	}
+	constraintText := ""
+	if w.wantConstraints() {
+		constraintText = constraintBlock(ts)
+	}
+	tsx.SetSubtaskRunner(w.newSubtaskRunner(name, intent.ID, runDir, proxyAddr, constraintText, hooks, emit))
 	// base = built-in worker tools ∪ host tools (traffic) ∪ default tools (incl. Bash);
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
@@ -416,19 +430,13 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 混入 per-intent 易变数据、失去跨意图缓存复用；这是刻意的取舍（意图丢失比省 token 严重得多）。
 	// 与 planner「态势块放 user turn」分叉是有意的：planner 本身是产意图的那个、没有单一 mandate，
 	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
-	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
-	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	proxyAddr := w.proxyAddr
-	if w.proxyAddrFn != nil {
-		proxyAddr = w.proxyAddrFn()
-	}
 	sysBody := workerSystem(proxyAddr, w.proxyCACert, w.workDir, runDir)
-	if w.wantConstraints() {
-		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
+	if constraintText != "" {
+		sysBody += constraintText // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
 	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
 	intentTimeout, intentTier := IntentRunTimeout(intent, w.runTimeout)
