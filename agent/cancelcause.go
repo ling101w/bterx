@@ -45,6 +45,8 @@ var (
 	// Per-work context.
 	AbortKilledByPlanner = cause("killed_by_planner", "规划者终止了这条意图",
 		"规划者调用 kill_work 主动终止了这条意图，通常表示方向跑偏或已无继续价值；意图会标记为 stopped，不会自动重新领取")
+	AbortWatchdogRecycle = cause("watchdog_recycle", "Watchdog 检测到卡死/死循环并自动重启",
+		"零策略 Watchdog 检测到该意图长时间无活动或陷入重复调用/连续报错死循环，已中止当前卡死会话；未达重启上限时会自动退回 frontier 并重发任务书由新 Worker 接续，达到上限则标记 blocked 移交规划者")
 	AbortWorkPausedByUser = cause("work_paused_by_user", "用户暂停了这条 Worker 意图",
 		"用户暂停了正在运行的 Worker。本次调用被取消，意图转为 paused；已经登记的意图、事实、漏洞和活动记录全部保留，恢复后从头重新执行")
 	AbortWorkCancelledByUser = cause("work_cancelled_by_user", "用户删除了这条 Worker 意图",

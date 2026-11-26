@@ -199,6 +199,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.engine.SetWorkerResolver(func(t *Task, slot WorkerSlot) (*agent.Worker, error) {
 		return s.workerForTaskSlot(t, slot)
 	})
+	s.engine.SetSameFamilyProfileResolver(s.sameFamilyHealthyProfile)
 	// Global readiness (Ready()/llm_configured): a global active LLM provider is
 	// installed. Task-level runnability is separate (ReadyFor → the resolver above).
 	s.engine.SetReadiness(func() bool {

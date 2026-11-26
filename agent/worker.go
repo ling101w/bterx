@@ -551,7 +551,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		alreadyRecorded = requestID != "" && hasWorkerChatMessage(s.Messages(), requestID)
 		if len(s.Messages()) > 0 && message == "" {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-			input = "继续执行。"
+			input = workerResumePrompt(intent)
 		} else if len(s.Messages()) > 0 {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
 		}
@@ -576,4 +576,27 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
 	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
 	return reason, tsx.Writes(), err
+}
+
+// workerResumePrompt re-delivers a concise mission brief when a Worker resumes
+// an intent from transcript after a pause, crash, or Watchdog recycle so the
+// resumed session remembers its exact objective and avoids repeating a wedged step.
+func workerResumePrompt(intent *db.Node) string {
+	summary := ""
+	if intent != nil && len(intent.Payload) > 0 {
+		var p struct {
+			Summary string `json:"summary"`
+		}
+		if json.Unmarshal(intent.Payload, &p) == nil {
+			summary = strings.TrimSpace(p.Summary)
+		}
+	}
+	if summary == "" {
+		return "【任务恢复 / 重发任务书】请基于历史记录中的已有进展继续推进本意图，避免重复刚才卡住或报错的同一条命令；已完成或证实不可行则立即写回事实并结束。"
+	}
+	if r := []rune(summary); len(r) > 280 {
+		summary = string(r[:280]) + "…"
+	}
+	return "【任务恢复 / 重发任务书】原始意图：" + summary +
+		"\n请基于历史记录中的已有进展继续推进，避免重复刚才卡住或报错的同一条命令；若已达成目标或证实不可行，请立即写回事实/发现并收尾。"
 }

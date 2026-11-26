@@ -158,11 +158,18 @@ type Engine struct {
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness       func() bool
 	proxyFailure    func(taskID string, err error)
-	telemetry       sync.Map // intentID (int64) -> *intentTelemetry
-	lastZombieCheck sync.Map // taskID -> time.Time, throttles zombie running-intent sweeps
+	telemetry        sync.Map // intentID (int64) -> *intentTelemetry
+	lastZombieCheck  sync.Map // taskID -> time.Time, throttles zombie running-intent sweeps
+	lastQuotaReopen  sync.Map // taskID -> time.Time, throttles llm_quota blocked-intent reopens
+	watchdogRestarts sync.Map // intentID (int64) -> int, automatic Watchdog recycle counter
+	watchdogInterval time.Duration
+	sameFamilyRotate func(pinnedID int64) (int64, string)
 }
 
 func (e *Engine) SetProxyFailureHandler(fn func(string, error)) { e.proxyFailure = fn }
+func (e *Engine) SetSameFamilyProfileResolver(fn func(pinnedID int64) (int64, string)) {
+	e.sameFamilyRotate = fn
+}
 
 type slotAvailability struct {
 	available bool
@@ -303,6 +310,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.coordStarted.Delete(taskID)
 	e.slotPlans.Delete(taskID)
 	e.lastZombieCheck.Delete(taskID)
+	e.lastQuotaReopen.Delete(taskID)
 	e.slotState.Range(func(key, _ any) bool {
 		keyText, ok := key.(string)
 		if ok && strings.HasPrefix(keyText, taskID+"/") {
@@ -698,6 +706,11 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
 	if msg, ok := h.drain(); ok {
+		if strings.HasPrefix(msg, "[Watchdog]") {
+			body := strings.TrimSpace(strings.TrimPrefix(msg, "[Watchdog]"))
+			return true, "【Watchdog 保活纠偏】" + body +
+				"\n（系统 Watchdog 检测到当前执行疑似卡死或重复循环；本次工具调用未执行，请先检查报错/状态并更换方法，勿原地重试。）", nil
+		}
 		return true, "【规划者实时纠偏】" + msg +
 			"\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）", nil
 	}
@@ -913,7 +926,7 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		t.Notify() // already running — just nudge a planning round
 		return
 	}
-	rt := e.registerTaskRoutines(ctx, t.ID, 1+len(slots))
+	rt := e.registerTaskRoutines(ctx, t.ID, 1+len(slots)+1)
 	plan := make(map[string]int64, len(slots))
 	for _, slot := range slots {
 		plan[slot.Name] = slot.ProfileID
@@ -922,6 +935,7 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	e.deleteMu.RUnlock()
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
+	runTaskRoutine(rt, func(loopCtx context.Context) { e.watchdogLoop(loopCtx, t) })
 	for _, slot := range slots {
 		slot := slot
 		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, slot) })
@@ -987,8 +1001,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	heartbeat := time.NewTimer(interval)
 	defer heartbeat.Stop()
 
-	// runRound 跑一轮规划(含 debounce 合并 + 各 guard)。src 仅用于日志区分触发来源。
-	runRound := func(src string) {
+	// runRound 跑一轮规划(含 debounce 合并 + 各 guard)。返回值表示本轮是否发生瞬时规划异常
+	// (用于零策略 Watchdog 短退避自愈，避免一次 API 抖动让整个任务干等 10 分钟心跳)。
+	runRound := func(src string) (planFailed bool) {
 		// debounce: coalesce a burst of changes into one planning round
 		timer := time.NewTimer(e.debounce)
 	drain:
@@ -1001,24 +1016,24 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		planner, _ := e.snapshotFor(t)
 		if planner == nil {
-			return // idle until LLM configured
+			return false // idle until LLM configured
 		}
 		if e.IsPaused(t.ID) {
-			return // user-paused: don't plan
+			return false // user-paused: don't plan
 		}
 		if e.IsDeleting(t.ID) {
-			return
+			return false
 		}
 		// terminal task (goals all met → done, or failed): the run is over. A
 		// resume/nudge — e.g. auto-resume of the active task on restart — must NOT
 		// re-plan (it would burn an LLM round and re-confirm a settled result).
 		if isTerminalStatus(t.lifecycleSnapshot().Status) {
-			return
+			return false
 		}
 		// 任务级超时收尾中:丢弃普通唤醒——worker 收尾写回、Resume 的 Notify 都不再
 		// 触发常规规划轮;终局那一轮由协调器(settleTask)直接驱动,不走这里。
 		if e.isSettling(t.ID) {
-			return
+			return false
 		}
 		e.reconcileZombieIntentsThrottled(t)
 		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
@@ -1037,10 +1052,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 						Summary: "目标已全部达成，直投意图已执行完毕，任务结束"})
 				}
 			}
-			return // goalless 分支永不进入 planner.Plan
+			return false // goalless 分支永不进入 planner.Plan
 		}
 		if !e.beginTaskOperation(t.ID) {
-			return
+			return false
 		}
 		defer e.decInflight(t.ID)
 		if err := e.m.StartTaskRunSegment(t.ID); err != nil {
@@ -1056,7 +1071,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
-			return
+			return false
 		}
 		log.Printf("[planner] task %s 规划中…(%s 触发)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
@@ -1076,6 +1091,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			if e.proxyFailure != nil && isProxyFailure(err) {
 				e.proxyFailure(t.ID, err)
 			}
+			planFailed = !e.IsPaused(t.ID) && !e.IsDeleting(t.ID) && !e.isSettling(t.ID) && !isTerminalStatus(t.lifecycleSnapshot().Status)
 		case met:
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
 			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
@@ -1090,20 +1106,38 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			log.Printf("[planner] task %s 规划完成", t.ID)
 		}
 		e.touch(t.ID)
+		return planFailed
 	}
 
+	consecutivePlanErrs := 0
 	for {
+		var failed bool
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.notify:
-			runRound("edge") // worker 结束 / finding / kill / resume / seed 首轮
+			failed = runRound("edge") // worker 结束 / finding / kill / resume / seed 首轮
 		case <-heartbeat.C:
 			// 周期兜底:死锁兜底 + 唤醒去监督飞行中的 worker(steer/kill) + 周期复查。
-			runRound("heartbeat")
+			src := "heartbeat"
+			if consecutivePlanErrs > 0 {
+				src = "watchdog_retry"
+			}
+			failed = runRound(src)
+		}
+		nextWait := interval
+		if failed {
+			consecutivePlanErrs++
+			if backoff, ok := watchdogPlannerBackoff(consecutivePlanErrs, interval); ok {
+				nextWait = backoff
+				log.Printf("[watchdog] task %s planner 瞬时出错，%v 后自动重试 (%d/%d)",
+					t.ID, nextWait, consecutivePlanErrs, len(plannerErrorRetryBackoffs))
+			}
+		} else {
+			consecutivePlanErrs = 0
 		}
 		// 每次唤醒(边沿或心跳)后重臂心跳:任意规划触发都重算这段静置计时。
-		resetPlannerTimer(heartbeat, interval)
+		resetPlannerTimer(heartbeat, nextWait)
 	}
 }
 
@@ -1358,8 +1392,37 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.touch(t.ID)
 		return true
 	}
+	// recycled by zero-policy Watchdog (hung/looping worker): automatically return
+	// to frontier (open) up to watchdogMaxRestartsPerIntent times so a fresh worker
+	// resumes with a re-sent mission brief without waking Planner; escalate only
+	// after exhausting automatic restarts.
+	if errors.Is(workCause, agent.AbortWatchdogRecycle) {
+		n := e.bumpWatchdogRestart(intent.ID)
+		iid := intent.ID
+		if n <= watchdogMaxRestartsPerIntent {
+			if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
+				log.Printf("[watchdog] task %s 意图 #%d 自动重开回退失败: %v", t.ID, intent.ID, err)
+			} else {
+				msg := fmt.Sprintf("[Watchdog] 意图 #%d 疑似卡死/死循环，已自动退回队列等待新 Worker 重发任务书接续 (%d/%d)", intent.ID, n, watchdogMaxRestartsPerIntent)
+				log.Printf("[watchdog] task %s %s", t.ID, msg)
+				e.emitActivity(t, db.Activity{NodeID: &iid, Worker: "watchdog", Kind: "text", Summary: msg, Detail: msg})
+			}
+			e.touch(t.ID)
+			return true
+		}
+		if err := transitionIntentState(t.Store, intent.ID, "running", "blocked"); err != nil {
+			log.Printf("[watchdog] task %s 意图 #%d 超限标记 blocked 失败: %v", t.ID, intent.ID, err)
+		}
+		msg := fmt.Sprintf("[Watchdog] 意图 #%d 自动重启已达上限(%d次)仍异常，标记 blocked 移交规划者处理", intent.ID, watchdogMaxRestartsPerIntent)
+		log.Printf("[watchdog] task %s %s", t.ID, msg)
+		e.emitActivity(t, db.Activity{NodeID: &iid, Worker: "watchdog", Kind: "text", IsError: true, Summary: msg, Detail: msg})
+		e.touch(t.ID)
+		t.NotifyDone(intent.ID)
+		return true
+	}
 	// killed by the planner: mark stopped (don't write back results, don't auto-reclaim).
 	if killed {
+		e.watchdogRestarts.Delete(intent.ID)
 		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d planner 停止落库失败: %v", name, t.ID, intent.ID, err)
 		}
@@ -1390,6 +1453,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		if stateErr := transitionIntentState(t.Store, intent.ID, "running", state); stateErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
 		}
+	}
+	if state == "done" {
+		e.watchdogRestarts.Delete(intent.ID)
 	}
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 	e.touch(t.ID)

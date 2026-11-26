@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +44,8 @@ type intentTelemetry struct {
 	repeatedToolCalls int
 	factsWritten      int
 	findingsWritten   int
+	watchdogNudged    bool
+	watchdogNudgedAt  time.Time
 }
 
 // IntentTelemetrySnapshot is a lock-free point-in-time view exposed on the
@@ -281,12 +285,30 @@ func (e *Engine) RunningIntentTelemetryForPlanner(taskID string) []agent.IntentT
 
 // resolveWorkerForIntent returns the pinned worker when an intent explicitly
 // carries a Supervisor/Commander-assigned pinned_profile_id; otherwise fallback.
+// When the pinned profile is currently circuit-broken, Watchdog transparently
+// rotates to a healthy same-model / same-family profile before falling back.
 func (e *Engine) resolveWorkerForIntent(t *Task, slotName string, intent *db.Node, fallback *agent.Worker) (*agent.Worker, int64) {
 	pinnedID := intentPinnedProfileID(intent)
 	if pinnedID <= 0 || e.workerResolve == nil {
 		return fallback, pinnedID
 	}
-	pinnedWorker, err := e.workerResolve(t, WorkerSlot{Name: slotName, ProfileID: pinnedID})
+	effectiveID := pinnedID
+	if e.sameFamilyRotate != nil {
+		if altID, altLabel := e.sameFamilyRotate(pinnedID); altID > 0 && altID != pinnedID {
+			effectiveID = altID
+			iid := intent.ID
+			msg := fmt.Sprintf("[Watchdog] 意图 #%d 指定的配置 #%d 正在熔断冷却，已自动同家族轮换至 #%d (%s)", iid, pinnedID, altID, altLabel)
+			log.Printf("[watchdog] task %s %s", t.ID, msg)
+			e.emitActivity(t, db.Activity{
+				NodeID:  &iid,
+				Worker:  "watchdog",
+				Kind:    "text",
+				Summary: msg,
+				Detail:  msg,
+			})
+		}
+	}
+	pinnedWorker, err := e.workerResolve(t, WorkerSlot{Name: slotName, ProfileID: effectiveID})
 	if err != nil || pinnedWorker == nil {
 		iid := intent.ID
 		msg := "指定模型配置不可用，已回退默认 Worker 模型"
@@ -303,5 +325,5 @@ func (e *Engine) resolveWorkerForIntent(t *Task, slotName string, intent *db.Nod
 		})
 		return fallback, 0
 	}
-	return pinnedWorker, pinnedID
+	return pinnedWorker, effectiveID
 }

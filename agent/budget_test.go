@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,5 +50,17 @@ func TestIntentRunTimeout(t *testing.T) {
 	}
 	if d, _ := IntentRunTimeout(mk(map[string]any{"run_seconds": 99999}), def); d != time.Duration(MaxIntentRunSeconds)*time.Second {
 		t.Fatalf("expected clamped max timeout, got %v", d)
+	}
+}
+
+func TestWorkerResumePromptRebriefsMission(t *testing.T) {
+	node := &db.Node{Payload: []byte(`{"summary":"验证 /api/v1/export 越权导出漏洞"}`)}
+	got := workerResumePrompt(node)
+	if !strings.Contains(got, "重发任务书") || !strings.Contains(got, "/api/v1/export") {
+		t.Fatalf("unexpected resume prompt: %q", got)
+	}
+	empty := workerResumePrompt(nil)
+	if !strings.Contains(empty, "重发任务书") {
+		t.Fatalf("empty intent resume prompt missing header: %q", empty)
 	}
 }
