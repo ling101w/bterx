@@ -309,6 +309,15 @@ func TestCleanupPreservesSharingAddedAfterQueueAndCommonReportFiles(t *testing.T
 	if !completed {
 		t.Fatal("late-sharing cleanup did not complete")
 	}
+	listed, err := m.pg.ListTaskCleanups(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range listed {
+		if job.ID == j.ID {
+			t.Fatal("completed cleanup job should not remain in active cleanup list")
+		}
+	}
 	for label, q := range map[string]string{"shared asset": `SELECT count(*) FROM assets WHERE id=$1`, "shared report": `SELECT count(*) FROM findings WHERE id=$1`} {
 		arg := asset
 		if label == "shared report" {

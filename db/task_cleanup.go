@@ -112,8 +112,11 @@ func (d *DB) FailTaskCleanup(ctx context.Context, id int64, cause error) error {
 	return err
 }
 
+// ListTaskCleanups returns unfinished task cleanup jobs (pending or failed) so
+// completed deletions disappear from the task panel once done while retaining
+// rows in task_cleanup_jobs for audit and repeat-delete idempotency.
 func (d *DB) ListTaskCleanups(ctx context.Context) ([]*TaskCleanupJob, error) {
-	rows, err := d.QueryContext(ctx, `SELECT `+cleanupColumns+` FROM task_cleanup_jobs ORDER BY (state<>'done') DESC,id DESC LIMIT 30`)
+	rows, err := d.QueryContext(ctx, `SELECT `+cleanupColumns+` FROM task_cleanup_jobs WHERE state<>'done' ORDER BY id DESC LIMIT 30`)
 	if err != nil {
 		return nil, err
 	}
