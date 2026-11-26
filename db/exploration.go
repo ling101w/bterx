@@ -348,6 +348,34 @@ WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID)
 	return n, nil
 }
 
+// StaleRunningIntents returns intent IDs still in state='running' whose DB row
+// has not been updated for at least olderThan. Engine.ReconcileZombieIntents
+// intersects these with its live in-memory work/telemetry maps to recover
+// intents orphaned by transient DB write failures (e.g. PG crash recovery).
+func (s *ExplorationStore) StaleRunningIntents(olderThan time.Duration) ([]int64, error) {
+	secs := int64(olderThan.Seconds())
+	if secs < 0 {
+		secs = 0
+	}
+	rows, err := s.db.Query(`SELECT id FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state='running'
+  AND updated_at <= now() - ($2 * interval '1 second')
+ORDER BY id`, s.expID, secs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ReopenIntent flips ONE not-successfully-finished intent (blocked/exhausted/stopped)
 // back to 'open' so a worker re-claims it (graph writes it already produced stay).
 // The worker resumes from its prior LLM transcript instead of restarting from scratch.

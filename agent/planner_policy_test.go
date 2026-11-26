@@ -128,3 +128,60 @@ func TestPlannerCompactOverviewPreservesGoalsHintsAndOriginal(t *testing.T) {
 		t.Fatal("source evidence mutated")
 	}
 }
+
+func TestPlannerCompactOverviewContractsReviewHintsAndColdDigests(t *testing.T) {
+	var hints []map[string]any
+	hints = append(hints, map[string]any{"id": int64(1), "origin": "human", "state": "active", "text": "人工重要提示：重点测登录接口"})
+	for i := int64(2); i <= 40; i++ {
+		hints = append(hints, map[string]any{
+			"id":     i,
+			"origin": ChainReviewerKey,
+			"state":  "active",
+			"text":   "【链路复盘建议 review-x】" + strings.Repeat("详细复盘内容", 200),
+		})
+	}
+	var digests []map[string]any
+	for i := int64(100); i < 115; i++ {
+		digests = append(digests, map[string]any{
+			"id":           i,
+			"member_count": 6,
+			"body":         strings.Repeat("冷区汇总结论", 80),
+		})
+	}
+	view := map[string]any{
+		"goals":        []map[string]any{{"id": int64(1), "text": "goal"}},
+		"hints":        hints,
+		"cold_digests": digests,
+		"coverage":     map[string]any{"pct": 50},
+	}
+	got := plannerCompactOverview(view)
+	keptHints := got["hints"].([]map[string]any)
+	// 1 human + latest 2 chain_reviewer hints = 3 kept; remaining 37 archived.
+	if len(keptHints) != 3 {
+		t.Fatalf("expected 3 kept hints (1 human + 2 review), got %d", len(keptHints))
+	}
+	if keptHints[0]["text"] != "人工重要提示：重点测登录接口" {
+		t.Fatalf("human hint altered: %v", keptHints[0])
+	}
+	arch, ok := got["archived_review_hints"].(map[string]any)
+	if !ok || arch["count"] != 37 {
+		t.Fatalf("expected 37 archived review hints, got %#v", got["archived_review_hints"])
+	}
+	keptDigests := got["cold_digests"].([]map[string]any)
+	if len(keptDigests) != contractedColdDigestsInline {
+		t.Fatalf("expected %d inline cold_digests, got %d", contractedColdDigestsInline, len(keptDigests))
+	}
+	idx := got["cold_digest_index"].([]string)
+	if len(idx) != 10 {
+		t.Fatalf("expected 10 indexed older cold_digests, got %d", len(idx))
+	}
+	// Original view must remain unmutated.
+	if len(view["hints"].([]map[string]any)) != 40 || len(view["cold_digests"].([]map[string]any)) != 15 {
+		t.Fatal("source overview mutated")
+	}
+	// Worker overview keeps at most 1 review hint and preserves human hints.
+	wgot := workerCompactOverview(view)
+	if len(wgot["hints"].([]map[string]any)) != 2 {
+		t.Fatalf("expected worker overview to keep 2 hints (1 human + 1 review), got %d", len(wgot["hints"].([]map[string]any)))
+	}
+}

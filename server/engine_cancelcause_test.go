@@ -220,3 +220,28 @@ func TestBootstrapAdmissionClearsQueuedPauseBarrier(t *testing.T) {
 		t.Fatal("bootstrap admission left the queued task behind the pause barrier")
 	}
 }
+
+func TestIsIntentLiveInProcessTracksWorkAndTelemetry(t *testing.T) {
+	e := NewEngine(nil)
+	if e.isIntentLiveInProcess(77) {
+		t.Fatal("untracked intent reported live")
+	}
+	_, cancel := context.WithCancelCause(context.Background())
+	e.registerWork(77, cancel)
+	if !e.isIntentLiveInProcess(77) {
+		t.Fatal("registered work not reported live")
+	}
+	_, complete := e.detachWork(77)
+	complete(nil)
+	if e.isIntentLiveInProcess(77) {
+		t.Fatal("detached work still reported live")
+	}
+	e.beginIntentTelemetry("t1", 88, "work#1", 0)
+	if !e.isIntentLiveInProcess(88) {
+		t.Fatal("active telemetry not reported live")
+	}
+	e.endIntentTelemetry(88)
+	if e.isIntentLiveInProcess(88) {
+		t.Fatal("ended telemetry still reported live")
+	}
+}

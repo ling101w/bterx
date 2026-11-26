@@ -69,9 +69,12 @@ func preview(s string, n int) string {
 // blocked 会白丢一条意图，所以这里对该终态额外重跑几次，每次之间退避一下，给
 // provider 恢复的时间；重试期间若被暂停/终止/取消则立即让位给对应分支处理。
 const (
-	modelErrorRetries      = 2               // model_error 收场后额外重试的次数
-	modelErrorRetryBackoff = 3 * time.Second // 每次重试前的退避
-	workControlWaitTimeout = 30 * time.Second
+	modelErrorRetries             = 2               // model_error 收场后额外重试的次数
+	modelErrorRetryBackoff        = 3 * time.Second // 每次重试前的退避
+	workControlWaitTimeout        = 30 * time.Second
+	intentStateTransitionAttempts = 4
+	zombieIntentGrace             = 60 * time.Second
+	zombieCheckInterval           = 60 * time.Second
 )
 
 var errWorkControlConflict = errors.New("work control conflict")
@@ -153,9 +156,10 @@ type Engine struct {
 	slotPlans            sync.Map // task -> map[slot name]profile ID; immutable for a run
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
-	readiness    func() bool
-	proxyFailure func(taskID string, err error)
-	telemetry    sync.Map // intentID (int64) -> *intentTelemetry
+	readiness       func() bool
+	proxyFailure    func(taskID string, err error)
+	telemetry       sync.Map // intentID (int64) -> *intentTelemetry
+	lastZombieCheck sync.Map // taskID -> time.Time, throttles zombie running-intent sweeps
 }
 
 func (e *Engine) SetProxyFailureHandler(fn func(string, error)) { e.proxyFailure = fn }
@@ -298,6 +302,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.inflight.Delete(taskID)
 	e.coordStarted.Delete(taskID)
 	e.slotPlans.Delete(taskID)
+	e.lastZombieCheck.Delete(taskID)
 	e.slotState.Range(func(key, _ any) bool {
 		keyText, ok := key.(string)
 		if ok && strings.HasPrefix(keyText, taskID+"/") {
@@ -497,14 +502,110 @@ func (e *Engine) releaseWorkControl(intentID int64, run *workExecution, action s
 }
 
 func transitionIntentState(store *db.ExplorationStore, intentID int64, expected, state string) error {
-	changed, err := store.CompareAndSetIntentState(intentID, expected, state)
-	if err != nil {
-		return err
+	var lastErr error
+	backoff := 200 * time.Millisecond
+	for attempt := 1; attempt <= intentStateTransitionAttempts; attempt++ {
+		changed, err := store.CompareAndSetIntentState(intentID, expected, state)
+		if err == nil {
+			if !changed {
+				return fmt.Errorf("%w: 意图 %d 不再是 %s 状态", db.ErrIntentStateConflict, intentID, expected)
+			}
+			return nil
+		}
+		lastErr = err
+		if attempt < intentStateTransitionAttempts {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
 	}
-	if !changed {
-		return fmt.Errorf("%w: 意图 %d 不再是 %s 状态", db.ErrIntentStateConflict, intentID, expected)
+	return lastErr
+}
+
+func (e *Engine) isIntentLiveInProcess(intentID int64) bool {
+	e.workMu.Lock()
+	_, liveWork := e.work[intentID]
+	e.workMu.Unlock()
+	if liveWork {
+		return true
 	}
-	return nil
+	_, liveTelemetry := e.telemetry.Load(intentID)
+	return liveTelemetry
+}
+
+func intentHasPersistedCompletion(store *db.ExplorationStore, intentID int64) bool {
+	if store == nil {
+		return false
+	}
+	if fids, err := store.FactsYielded(intentID); err == nil && len(fids) > 0 {
+		return true
+	}
+	if acts, _, err := store.ActivityList(&intentID, 0, 200); err == nil {
+		for i := range acts {
+			if acts[i].Kind == "result" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ReconcileZombieIntents detects DB intents stuck in state='running' that have
+// no live in-process worker/telemetry handle (e.g. after a transient PG crash
+// recovery caused the final state transition to fail) and reconciles them:
+// intents that already persisted facts or a terminal result are settled to
+// 'done', while unfinished orphans are returned to 'open' for re-claim.
+func (e *Engine) ReconcileZombieIntents(t *Task, grace time.Duration) (reopened, closed int) {
+	if t == nil || t.Store == nil {
+		return 0, 0
+	}
+	staleIDs, err := t.Store.StaleRunningIntents(grace)
+	if err != nil || len(staleIDs) == 0 {
+		return 0, 0
+	}
+	for _, id := range staleIDs {
+		if e.isIntentLiveInProcess(id) {
+			continue
+		}
+		targetState := "open"
+		msg := fmt.Sprintf("检测到意图 #%d 无存活 worker（疑似终态落库失败/僵尸 running），已自动回退为 open 等待重新领取", id)
+		if intentHasPersistedCompletion(t.Store, id) {
+			targetState = "done"
+			msg = fmt.Sprintf("检测到意图 #%d 无存活 worker 但已产出结论/事实（疑似终态落库失败/僵尸 running），已自动收口为 done", id)
+		}
+		if err := transitionIntentState(t.Store, id, "running", targetState); err != nil {
+			if !errors.Is(err, db.ErrIntentStateConflict) {
+				log.Printf("[zombie-recovery] task %s 意图 #%d 回收为 %s 失败: %v", t.ID, id, targetState, err)
+			}
+			continue
+		}
+		if targetState == "done" {
+			closed++
+		} else {
+			reopened++
+		}
+		iid := id
+		log.Printf("[zombie-recovery] task %s %s", t.ID, msg)
+		e.emitActivity(t, db.Activity{NodeID: &iid, Worker: "system", Kind: "text", Summary: msg, Detail: msg})
+	}
+	if reopened > 0 || closed > 0 {
+		e.touch(t.ID)
+		t.Notify()
+	}
+	return reopened, closed
+}
+
+func (e *Engine) reconcileZombieIntentsThrottled(t *Task) {
+	if t == nil || e.IsPaused(t.ID) || e.IsDeleting(t.ID) {
+		return
+	}
+	now := time.Now()
+	if v, ok := e.lastZombieCheck.Load(t.ID); ok {
+		if last, ok := v.(time.Time); ok && now.Sub(last) < zombieCheckInterval {
+			return
+		}
+	}
+	e.lastZombieCheck.Store(t.ID, now)
+	e.ReconcileZombieIntents(t, zombieIntentGrace)
 }
 
 // SteerWork queues a mid-run course-correction for the work running intentID (the
@@ -919,6 +1020,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.isSettling(t.ID) {
 			return
 		}
+		e.reconcileZombieIntentsThrottled(t)
 		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
 		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
@@ -1063,8 +1165,11 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, slot WorkerSlot) {
 		}
 		claimed := e.runWorkerStep(ctx, t, name, worker)
 		e.decInflight(t.ID)
-		if !claimed && sleepCtx(ctx, 800*time.Millisecond) {
-			return
+		if !claimed {
+			e.reconcileZombieIntentsThrottled(t)
+			if sleepCtx(ctx, 800*time.Millisecond) {
+				return
+			}
 		}
 	}
 }

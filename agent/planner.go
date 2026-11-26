@@ -385,7 +385,10 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
 	}
+	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好（update_playbook 与 L0 PLAYBOOK.json 均落盘在此）。
+	taskDir := ensureRunDir(p.workDir, taskID, 0)
 	tsx.SetTaskID(taskID)
+	tsx.SetPlaybookDirs(p.workDir, taskDir)
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
@@ -420,8 +423,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if tc.Final {
 		situational += "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + resolveTaskTimeoutWrapup("planner")
 	}
-	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
-	taskDir := ensureRunDir(p.workDir, taskID, 0)
+	// 本任务的工作目录已在上方建好，直接注入审计上下文。
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
 	sysBody := plannerSystem(goal, p.workDir, taskDir) + plannerDispatchInstruction + plannerCommanderInstruction
 	if p.wantConstraints() {
@@ -498,8 +500,12 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 			lead = "本轮是**定时巡检（心跳到点）**的唤醒，且当前**已没有任何 open 或 running 意图**。请先核对目标是否达成、检查 recent_stopped_intents 与 retracted_facts 避免重踩死路；有未覆盖且可推进的新方向时立即 add_intent 派发，若确因缺少前置条件/权限/新证据而暂无合理方向，请调用 planner_decision 如实说明原因（不要为凑数编造无效意图）："
 		}
 	}
+	// 路径 A：静态前缀（SystemPrompt + Tool Schema）保持逐字节不变以保 Prefix Cache；
+	// 每次唤醒把最新 PLAYBOOK.json 尾挂在最新事件快照消息尾部（并自动刷新 shared_index 与清理已解决目标）。
+	playbook, prunedTargets, _ := ReconcilePlaybook(p.workDir, taskDir, ts)
 	input := lead + situational + "\n\n据上面的态势，判定目标。目标已【真正达成】（已拿到目标成果/已确认目标漏洞）时用 prove_goal 逐个标记。若目标未达成且当前无 open/running 意图（frontier_open=0 且 running_intents 为空），请优先派发未覆盖的新方向；若确因缺少前置条件或所有已知方向已证伪而无合理新意图，调用 planner_decision 如实说明原因，禁止编造重复或无意义意图。" +
-		renderPlannerTodos(opts.Todos.List())
+		renderPlannerTodos(opts.Todos.List()) +
+		renderPlaybookTail(playbook, prunedTargets)
 	// MaxDuration 现在会在墙钟到点打断在跑工具并就地进收尾(在活 ctx 上),单轮卡死不再
 	// 绕过收尾,无需外部硬 ctx 兜底。ctx 只承载 pause / kill / shutdown。
 	_, _, err = captureRun(ctx, opts, input,
