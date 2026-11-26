@@ -38,11 +38,25 @@ type cgEdge struct {
 
 // coldParams are the tunable thresholds (cold-digest §7).
 type coldParams struct {
-	R int // debounce: a node must be continuously inactive ≥R planner rounds (§7 R=6)
-	K int // min block size to fold; K=2 skips only degenerate singletons (§7 K=2)
+	R          int // debounce: a node must be continuously inactive ≥R planner rounds (§7 R=6)
+	K          int // min block size to fold; K=2 skips only degenerate singletons (§7 K=2)
+	MaxMembers int // hard upper bound on cold members in one folded block (0 = unlimited)
+	MaxBytes   int // hard upper bound on estimated input bytes per folded block (0 = unlimited)
 }
 
-func defaultColdParams() coldParams { return coldParams{R: 6, K: 2} }
+const (
+	defaultColdMaxMembers = 24
+	defaultColdMaxBytes   = 32 * 1024 // ~16K tokens max per compactor LLM call
+)
+
+func defaultColdParams() coldParams {
+	return coldParams{
+		R:          6,
+		K:          2,
+		MaxMembers: defaultColdMaxMembers,
+		MaxBytes:   defaultColdMaxBytes,
+	}
+}
 
 // coldGraph is an in-memory adjacency view over real exploration edges. The
 // derived view layer (kind=digest nodes, rel=covers edges) is filtered out at
@@ -208,6 +222,15 @@ type block struct {
 //
 // Only components of size ≥K survive (§3① skips degenerate singletons).
 func (g *coldGraph) group(set map[int64]bool, p coldParams) []block {
+	return g.groupWithSizes(set, p, nil)
+}
+
+// groupWithSizes partitions `set` into foldable blocks like group, then splits
+// any oversized connected component deterministically along causal (topological
+// BFS) order so no single compactor call exceeds p.MaxMembers or p.MaxBytes.
+// Earlier full chunks retain stable member/anchor signatures as new cold nodes
+// attach to the frontier, letting major compaction reuse them without LLM work.
+func (g *coldGraph) groupWithSizes(set map[int64]bool, p coldParams, sizeOf func(int64) int) []block {
 	uf := newUnionFind(set)
 	// rule ①: real cold↔cold edges.
 	for from := range set {
@@ -240,41 +263,180 @@ func (g *coldGraph) group(set map[int64]bool, p coldParams) []block {
 			uf.union(sibs[0], sibs[i])
 		}
 	}
-	// Emit surviving components as blocks, each with its external-parent anchors.
+	// Emit surviving components as size-bounded blocks, each with external-parent anchors.
 	comps = uf.components()
 	var blocks []block
 	for _, ids := range comps {
 		if len(ids) < p.K {
 			continue
 		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		memberSet := make(map[int64]bool, len(ids))
-		for _, m := range ids {
-			memberSet[m] = true
-		}
-		anchorSet := map[int64]bool{}
-		for _, m := range ids {
-			for _, par := range g.parents[m] {
-				if memberSet[par] {
-					continue
-				}
-				pn, ok := g.nodes[par]
-				if !ok || pn.Kind == db.KindDigest {
-					continue
-				}
-				anchorSet[par] = true
+		chunks := g.splitComponent(ids, p, sizeOf)
+		for _, chunk := range chunks {
+			if len(chunk) < p.K {
+				continue
 			}
+			blocks = append(blocks, g.buildBlock(chunk))
 		}
-		anchors := make([]int64, 0, len(anchorSet))
-		for a := range anchorSet {
-			anchors = append(anchors, a)
-		}
-		sort.Slice(anchors, func(i, j int) bool { return anchors[i] < anchors[j] })
-		blocks = append(blocks, block{Members: ids, Anchors: anchors})
 	}
 	// Deterministic order: by smallest member id.
 	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Members[0] < blocks[j].Members[0] })
 	return blocks
+}
+
+func (g *coldGraph) buildBlock(ids []int64) block {
+	sorted := append([]int64(nil), ids...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	memberSet := make(map[int64]bool, len(sorted))
+	for _, m := range sorted {
+		memberSet[m] = true
+	}
+	anchorSet := map[int64]bool{}
+	for _, m := range sorted {
+		for _, par := range g.parents[m] {
+			if memberSet[par] {
+				continue
+			}
+			pn, ok := g.nodes[par]
+			if !ok || pn.Kind == db.KindDigest {
+				continue
+			}
+			anchorSet[par] = true
+		}
+	}
+	anchors := make([]int64, 0, len(anchorSet))
+	for a := range anchorSet {
+		anchors = append(anchors, a)
+	}
+	sort.Slice(anchors, func(i, j int) bool { return anchors[i] < anchors[j] })
+	return block{Members: sorted, Anchors: anchors}
+}
+
+func (g *coldGraph) splitComponent(ids []int64, p coldParams, sizeOf func(int64) int) [][]int64 {
+	sorted := append([]int64(nil), ids...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	needsSplit := p.MaxMembers > 0 && len(sorted) > p.MaxMembers
+	if !needsSplit && p.MaxBytes > 0 && sizeOf != nil {
+		total := 0
+		for _, id := range sorted {
+			total += effectiveNodeSize(sizeOf(id))
+			if total > p.MaxBytes {
+				needsSplit = true
+				break
+			}
+		}
+	}
+	if !needsSplit {
+		return [][]int64{sorted}
+	}
+	ordered := g.topoBFSOrder(sorted)
+	var chunks [][]int64
+	var cur []int64
+	curBytes := 0
+	for _, id := range ordered {
+		sz := 0
+		if sizeOf != nil {
+			sz = effectiveNodeSize(sizeOf(id))
+		}
+		hitMembers := p.MaxMembers > 0 && len(cur) >= p.MaxMembers
+		hitBytes := p.MaxBytes > 0 && sizeOf != nil && curBytes+sz > p.MaxBytes
+		if len(cur) > 0 && (hitMembers || hitBytes) {
+			chunks = append(chunks, cur)
+			cur = nil
+			curBytes = 0
+		}
+		cur = append(cur, id)
+		curBytes += sz
+	}
+	if len(cur) > 0 {
+		chunks = append(chunks, cur)
+	}
+	// Prevent a stranded trailing singleton (< K): borrow one node from the
+	// preceding chunk when it stays ≥K, otherwise merge the singleton back.
+	minK := p.K
+	if minK < 2 {
+		minK = 2
+	}
+	if len(chunks) >= 2 && len(chunks[len(chunks)-1]) < minK {
+		prev := chunks[len(chunks)-2]
+		last := chunks[len(chunks)-1]
+		if len(prev) > minK {
+			stolen := prev[len(prev)-1]
+			chunks[len(chunks)-2] = prev[:len(prev)-1]
+			chunks[len(chunks)-1] = append([]int64{stolen}, last...)
+		} else {
+			chunks[len(chunks)-2] = append(prev, last...)
+			chunks = chunks[:len(chunks)-1]
+		}
+	}
+	return chunks
+}
+
+func effectiveNodeSize(raw int) int {
+	if raw < 128 {
+		return 128
+	}
+	return raw
+}
+
+// topoBFSOrder traverses a component's members from its in-component roots
+// downstream in deterministic ascending-ID order, keeping causal parent→child
+// chains localized inside the same chunk and keeping prefix chunks stable as
+// higher-ID nodes are appended later.
+func (g *coldGraph) topoBFSOrder(sortedIDs []int64) []int64 {
+	inComp := make(map[int64]bool, len(sortedIDs))
+	for _, id := range sortedIDs {
+		inComp[id] = true
+	}
+	var roots []int64
+	for _, id := range sortedIDs {
+		hasInParent := false
+		for _, par := range g.parents[id] {
+			if inComp[par] {
+				hasInParent = true
+				break
+			}
+		}
+		if !hasInParent {
+			roots = append(roots, id)
+		}
+	}
+	visited := make(map[int64]bool, len(sortedIDs))
+	ordered := make([]int64, 0, len(sortedIDs))
+	bfsFrom := func(seeds []int64) {
+		queue := make([]int64, 0, len(seeds))
+		for _, s := range seeds {
+			if !visited[s] {
+				visited[s] = true
+				queue = append(queue, s)
+			}
+		}
+		for len(queue) > 0 {
+			u := queue[0]
+			queue = queue[1:]
+			ordered = append(ordered, u)
+			var kids []int64
+			for _, c := range g.children[u] {
+				if inComp[c] && !visited[c] {
+					kids = append(kids, c)
+				}
+			}
+			sort.Slice(kids, func(i, j int) bool { return kids[i] < kids[j] })
+			for _, c := range kids {
+				if !visited[c] {
+					visited[c] = true
+					queue = append(queue, c)
+				}
+			}
+		}
+	}
+	bfsFrom(roots)
+	// Fallback for any nodes inside a pure cycle with no in-component root.
+	for _, id := range sortedIDs {
+		if !visited[id] {
+			bfsFrom([]int64{id})
+		}
+	}
+	return ordered
 }
 
 // blockSignature is the change-detection key (§5.3): a hash over the sorted

@@ -175,7 +175,9 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 			uncompressed[id] = true
 		}
 	}
-	blocks := g.group(uncompressed, c.params)
+	blocks := g.groupWithSizes(uncompressed, c.params, func(id int64) int {
+		return nodeCompressionBytes(nodeByID[id])
+	})
 	if len(blocks) == 0 {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
@@ -219,7 +221,9 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 	}
 	hot := g.hotSet()
 	elig := g.eligibleCold(g.structuralCold(hot), stamps, round, c.params)
-	blocks := g.group(elig, c.params)
+	blocks := g.groupWithSizes(elig, c.params, func(id int64) int {
+		return nodeCompressionBytes(nodeByID[id])
+	})
 
 	bySig := map[string]*db.Node{}
 	for _, d := range active {
@@ -459,6 +463,20 @@ func nodeConfidence(n *db.Node) string {
 	return ""
 }
 
+const (
+	maxCompressionMemberRunes = 1200
+	maxCompressionAnchorRunes = 300
+	maxCompressionAnchors     = 8
+)
+
+func nodeCompressionBytes(n *db.Node) int {
+	s := nodeSummary(n)
+	if r := []rune(s); len(r) > maxCompressionMemberRunes {
+		s = string(r[:maxCompressionMemberRunes])
+	}
+	return len(s) + 160 // line header + edge/metadata overhead
+}
+
 // buildCompressionInput renders the connected sub-graph for the §4 prompt:
 // member nodes (summary + id + kind + state + confidence), the internal blood
 // edges among members, and — for a §3.1 shared-parent group — the anchor parents
@@ -480,7 +498,7 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 		if n != nil {
 			state = n.State
 		}
-		line := fmt.Sprintf("- #%d [%s/%s] %s", m, kind, state, nodeSummary(n))
+		line := fmt.Sprintf("- #%d [%s/%s] %s", m, kind, state, truncateRunes(nodeSummary(n), maxCompressionMemberRunes))
 		if conf := nodeConfidence(n); conf != "" {
 			line += fmt.Sprintf(" (confidence=%s)", conf)
 		}
@@ -504,13 +522,22 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 	}
 	if len(b.Anchors) > 0 {
 		sb.WriteString("\n【共同父 / 上下文锚（不是成员，只用于理解这些结果从哪个意图探出）】：\n")
-		for _, a := range b.Anchors {
+		shown := b.Anchors
+		omitted := 0
+		if len(shown) > maxCompressionAnchors {
+			omitted = len(shown) - maxCompressionAnchors
+			shown = shown[:maxCompressionAnchors]
+		}
+		for _, a := range shown {
 			n := nodeByID[a]
 			state := ""
 			if n != nil {
 				state = n.State
 			}
-			fmt.Fprintf(&sb, "- #%d [%s] %s\n", a, state, nodeSummary(n))
+			fmt.Fprintf(&sb, "- #%d [%s] %s\n", a, state, truncateRunes(nodeSummary(n), maxCompressionAnchorRunes))
+		}
+		if omitted > 0 {
+			fmt.Fprintf(&sb, "- （其余 %d 个上游锚点已省略）\n", omitted)
 		}
 	}
 	return sb.String()

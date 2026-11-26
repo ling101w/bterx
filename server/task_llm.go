@@ -595,6 +595,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxyProvider(s.m.ProxyAddr)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
+	wk.SetSubtaskProvider(s.subtaskFastProvider)     // delegate_subtask 默认走快模型，减轻旗舰上下文与费用
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
@@ -698,8 +699,20 @@ func (s *Server) workerForTaskSlot(t *Task, slot WorkerSlot) (*agent.Worker, err
 	worker.SetProxyProvider(s.m.ProxyAddr)
 	worker.SetWebSearch(s.webSearchFor("worker"))
 	worker.SetConstraintInject(s.constraintInjectWorker)
+	worker.SetSubtaskProvider(s.subtaskFastProvider)
 	bundle.pinnedWorkers[id] = worker
 	return worker, nil
+}
+
+// subtaskFastProvider returns the active/default fast provider for 1-level
+// delegate_subtask sub-workers so even a flagship pinned Worker offloads
+// noisy JS/log parsing onto a fast Flash model.
+func (s *Server) subtaskFastProvider() (llm.Provider, string) {
+	prov, cfg, ok := s.globalProvider()
+	if !ok || prov == nil {
+		return nil, ""
+	}
+	return prov, cfg.Model
 }
 
 func (s *Server) syncTaskLLMState(pt *db.Task) {

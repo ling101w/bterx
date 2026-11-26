@@ -174,3 +174,104 @@ func TestStampOps(t *testing.T) {
 		t.Fatalf("node 3 revived (not cold) → stamp must be cleared, got %+v", got[3])
 	}
 }
+
+func TestGrouping_SplitsOversizedComponentByMembersAndBytes(t *testing.T) {
+	// Build a linear chain of 11 cold nodes: 1 -> 2 -> ... -> 11.
+	var nodes []cgNode
+	var edges []cgEdge
+	elig := map[int64]bool{}
+	for id := int64(1); id <= 11; id++ {
+		if id%2 == 1 {
+			nodes = append(nodes, intent(id, "done"))
+		} else {
+			nodes = append(nodes, fact(id))
+		}
+		elig[id] = true
+		if id > 1 {
+			edges = append(edges, derived(id-1, id))
+		}
+	}
+	g := newColdGraph(nodes, edges)
+	// MaxMembers=4 would naively yield chunks [4, 4, 3]; verify all chunks obey bounds and >= K.
+	p := coldParams{R: 6, K: 2, MaxMembers: 4, MaxBytes: 0}
+	blocks := g.groupWithSizes(elig, p, nil)
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 bounded blocks, got %d: %+v", len(blocks), blocks)
+	}
+	seen := map[int64]bool{}
+	for i, b := range blocks {
+		if len(b.Members) < p.K || len(b.Members) > p.MaxMembers {
+			t.Fatalf("block %d out of bounds [%d,%d]: %+v", i, p.K, p.MaxMembers, b.Members)
+		}
+		for _, m := range b.Members {
+			if seen[m] {
+				t.Fatalf("duplicate member %d across chunks", m)
+			}
+			seen[m] = true
+		}
+	}
+	if len(seen) != 11 {
+		t.Fatalf("expected all 11 members covered, got %d", len(seen))
+	}
+	// Downstream chunk must retain its upstream cross-chunk parent as an anchor.
+	if len(blocks[1].Anchors) != 1 || blocks[1].Anchors[0] != 4 {
+		t.Fatalf("expected chunk 1 anchor [4], got %+v", blocks[1].Anchors)
+	}
+
+	// Trailing singleton rebalance: 9 nodes with MaxMembers=4 -> [4, 3, 2], never leaving [1].
+	elig9 := map[int64]bool{}
+	for id := int64(1); id <= 9; id++ {
+		elig9[id] = true
+	}
+	blocks9 := g.groupWithSizes(elig9, p, nil)
+	if len(blocks9) != 3 {
+		t.Fatalf("expected 3 rebalanced blocks for 9 nodes, got %d: %+v", len(blocks9), blocks9)
+	}
+	for i, b := range blocks9 {
+		if len(b.Members) < p.K {
+			t.Fatalf("chunk %d stranded below K: %+v", i, b.Members)
+		}
+	}
+
+	// Byte-budget splitting: each node costs 2000 bytes, MaxBytes=5000 -> max 2 nodes per chunk.
+	pBytes := coldParams{R: 6, K: 2, MaxMembers: 24, MaxBytes: 5000}
+	blocksB := g.groupWithSizes(elig, pBytes, func(int64) int { return 2000 })
+	if len(blocksB) < 5 {
+		t.Fatalf("expected byte-bounded split into >=5 blocks, got %d: %+v", len(blocksB), blocksB)
+	}
+	for i, b := range blocksB {
+		if len(b.Members) < pBytes.K {
+			t.Fatalf("byte-split chunk %d below K: %+v", i, b.Members)
+		}
+		if len(b.Members) > 3 {
+			t.Fatalf("byte-split chunk %d exceeded byte cap: %+v", i, b.Members)
+		}
+	}
+}
+
+func TestGrouping_PrefixChunksKeepStableSignatureOnFrontierGrowth(t *testing.T) {
+	// Start with chain 1..6 (MaxMembers=4 -> chunks [1,2,3,4], [5,6]).
+	build := func(n int64) (*coldGraph, map[int64]bool, map[int64]int) {
+		var nodes []cgNode
+		var edges []cgEdge
+		elig := map[int64]bool{}
+		cvers := map[int64]int{}
+		for id := int64(1); id <= n; id++ {
+			nodes = append(nodes, fact(id))
+			elig[id] = true
+			cvers[id] = 0
+			if id > 1 {
+				edges = append(edges, derived(id-1, id))
+			}
+		}
+		return newColdGraph(nodes, edges), elig, cvers
+	}
+	p := coldParams{R: 6, K: 2, MaxMembers: 4, MaxBytes: 32 * 1024}
+	g6, e6, cv6 := build(6)
+	b6 := g6.groupWithSizes(e6, p, nil)
+	g10, e10, cv10 := build(10)
+	b10 := g10.groupWithSizes(e10, p, nil)
+	if blockSignature(b6[0], cv6) != blockSignature(b10[0], cv10) {
+		t.Fatalf("prefix chunk 0 signature drifted when tail grew: %+v vs %+v", b6[0], b10[0])
+	}
+}

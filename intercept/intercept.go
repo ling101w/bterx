@@ -289,7 +289,8 @@ type Decision struct {
 	RuleName         string
 	ConfigDigest     string
 	ProfileID        int64
-	Action           string // "allow" | "deny" | "ask"
+	Action           string  // "allow" | "deny" | "ask"
+	Confidence       float64 // Jev System One confidence [0,1]; 0 for rule/LLM verdicts
 	Message          string
 	RuleID           int64
 	TimeoutEnabled   bool
@@ -312,6 +313,7 @@ const (
 	settingJudgeAskTimeoutAction = "llm_judge_ask_timeout_action"
 	settingJudgeIncompleteScript = "llm_judge_incomplete_script_action"
 	settingJudgeConfidence       = "llm_judge_confidence_threshold"
+	settingJudgeSecondaryProfile = "llm_judge_secondary_profile_id"
 )
 
 // Judge default values.
@@ -340,6 +342,7 @@ type JudgeConfig struct {
 	AskTimeoutAction       string  `json:"ask_timeout_action"`       // allow|deny
 	IncompleteScriptAction string  `json:"incomplete_script_action"` // ask|model
 	ConfidenceThreshold    float64 `json:"confidence_threshold"`     // Jev only; below this becomes ask
+	SecondaryProfileID     int64   `json:"secondary_profile_id"`     // Optional System 2 LLM reviewer when Jev returns ask/borderline/error
 }
 
 // judgeConfig reads the judge configuration from settings, applying defaults for
@@ -357,6 +360,7 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 		AskTimeoutAction:       i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
 		IncompleteScriptAction: i.getSettingChoice(settingJudgeIncompleteScript, DefaultIncompleteScriptAction, "ask", "model"),
 		ConfidenceThreshold:    i.getSettingFloat(settingJudgeConfidence, defaultJudgeConfidence),
+		SecondaryProfileID:     int64(i.getSettingInt(settingJudgeSecondaryProfile, 0)),
 	}
 	// Prompt: stored value if non-empty, else the built-in template.
 	if v, ok, _ := i.db.GetSetting(settingJudgePrompt); ok && strings.TrimSpace(v) != "" {
@@ -464,6 +468,12 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 		return err
 	}
 	if err := i.db.SetSetting(settingJudgeConfidence, strconv.FormatFloat(c.ConfidenceThreshold, 'f', 4, 64)); err != nil {
+		return err
+	}
+	if c.SecondaryProfileID < 0 {
+		c.SecondaryProfileID = 0
+	}
+	if err := i.db.SetSetting(settingJudgeSecondaryProfile, strconv.FormatInt(c.SecondaryProfileID, 10)); err != nil {
 		return err
 	}
 	return nil

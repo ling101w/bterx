@@ -43,6 +43,12 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 		if ys := yieldsOf[n.ID]; len(ys) > 0 {
 			m["yields"] = ys // 下游：本意图产生了哪些事实/发现
 		}
+		if bt, ok := p["budget_tier"].(string); ok && bt != "" {
+			m["budget_tier"] = bt
+		}
+		if rs, ok := p["run_seconds"]; ok && rs != nil {
+			m["run_seconds"] = rs
+		}
 		out = append(out, m)
 	}
 	return out
@@ -82,6 +88,11 @@ type ToolSet struct {
 	listProfiles     func() []PlannerLLMProfile
 	validateProfile  func(profileID int64) (model string, ok bool)
 	runningTelemetry func() []IntentTelemetryInfo
+	// L0 Playbook storage roots (wired by Planner for update_playbook).
+	playbookWorkDir string
+	playbookTaskDir string
+	// Per-intent bounded 1-level sub-worker delegation (wired by Worker).
+	subtaskRunner SubtaskRunner
 	// enrich, if set, receives async auto-completion triggers (DNS resolve for a
 	// domain, HTTP probe for a site). nil = no engine enrichment.
 	enrich EnrichTrigger
@@ -177,6 +188,13 @@ func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can
 // dual-write to the standalone findings table (which survives task deletion).
 func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
+
+// SetPlaybookDirs wires the workDir and per-task directory used by
+// update_playbook to persist PLAYBOOK.json and scan L1 shared_index.
+func (t *ToolSet) SetPlaybookDirs(workDir, taskDir string) {
+	t.playbookWorkDir = workDir
+	t.playbookTaskDir = taskDir
+}
 
 // SetCoverageEnabled records whether this task has the asset-coverage feature on
 // (default enabled). Passing false makes graphOverviewData omit the coverage block
@@ -379,6 +397,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
 		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
+		if h.Origin != "" {
+			hint["origin"] = h.Origin
+		}
 		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
 		}
@@ -1191,6 +1212,8 @@ type intentItem struct {
 	Priority        int                `json:"priority"`
 	PinnedProfileID json.RawMessage    `json:"pinned_profile_id"`
 	ModelReason     string             `json:"model_reason"`
+	BudgetTier      string             `json:"budget_tier"`
+	RunSeconds      json.RawMessage    `json:"run_seconds"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1216,6 +1239,10 @@ func (t *ToolSet) addOneIntentContext(ctx context.Context, it intentItem) (int64
 			return 0, fmt.Errorf("pinned_profile_id #%d 不存在或配置无效（请先看 llm_profiles 或调 list_llm_profiles）", pinnedID)
 		}
 		pinnedModel = model
+	}
+	budgetTier, runSeconds, err := NormalizeIntentBudget(it.BudgetTier, int(pid(it.RunSeconds)))
+	if err != nil {
+		return 0, err
 	}
 	// 先校验锚点（建节点前，避免坏锚点留下孤儿意图）。
 	parents := pidList(it.ParentIDs)
@@ -1282,6 +1309,12 @@ func (t *ToolSet) addOneIntentContext(ctx context.Context, it intentItem) (int64
 			payload["model_reason"] = mr
 		}
 	}
+	if budgetTier != "" {
+		payload["budget_tier"] = budgetTier
+	}
+	if runSeconds > 0 {
+		payload["run_seconds"] = runSeconds
+	}
 	if len(parents) == 0 {
 		if origin, _ := t.ts.OriginFactID(); origin > 0 {
 			parents = []int64{origin}
@@ -1297,9 +1330,10 @@ func (t *ToolSet) addOneIntentContext(ctx context.Context, it intentItem) (int64
 func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。\n"+
-		"★主动模型分级：常规信息收集/广度扫描留空 pinned_profile_id（走默认快模型）；仅当弱模型卡住、或面对复杂业务逻辑/多步利用链时，传 pinned_profile_id 升档到强模型或换厂商破局。",
+		"★主动模型分级：常规信息收集/广度扫描留空 pinned_profile_id（走默认快模型）；仅当弱模型卡住、或面对复杂业务逻辑/多步利用链时，传 pinned_profile_id 升档到强模型或换厂商破局。\n"+
+		"★动态超时预算：可选传 budget_tier（quick=10m 轻探/快扫、standard=20m 常规、deep=40m 复杂链/慢强模型、endgame=60m 高分残局硬骨头）或精确 run_seconds（180~3600 秒）；省略则沿用默认档。仍受任务总截止时间夹逼。",
 		obj(map[string]any{
-			"intents":           map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/pinned_profile_id/model_reason）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"intents":           map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/pinned_profile_id/model_reason/budget_tier/run_seconds）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
 			"summary":           str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
 			"asset_ids":         map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
 			"parent_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示，也不能填已被撤回(retracted)的事实**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
@@ -1307,6 +1341,8 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			"priority":          intp("优先级 0-10，默认5"),
 			"pinned_profile_id": idp("可选：主动模型分级。指定执行本意图的 LLM profile id（来自 llm_profiles / list_llm_profiles）；常规任务留空走默认档，复杂攻坚或弱模型卡住时升档强模型/跨厂商模型"),
 			"model_reason":      str("可选：传 pinned_profile_id 时简要说明升档/换模型理由"),
+			"budget_tier":       map[string]any{"type": "string", "enum": []string{BudgetTierQuick, BudgetTierStandard, BudgetTierDeep, BudgetTierEndgame}, "description": "可选：动态超时档位。quick=600s(10m 轻探)、standard=1200s(20m 常规)、deep=2400s(40m 深挖/慢强模型)、endgame=3600s(60m 残局压轴)"},
+			"run_seconds":       intp("可选：精确指定本意图最大运行时长（180~3600 秒），优先级高于 budget_tier"),
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -2377,9 +2413,10 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
-		// Unified Task Commander tools: retract hallucinated facts (with cascade stop)
-		// and persist asset-scoped shared notes for automatic worker push.
+		// Unified Task Commander tools: retract hallucinated facts (with cascade stop),
+		// persist asset-scoped shared notes, and maintain L0 PLAYBOOK.json.
 		t.retractFactTool(),
 		t.recordAssetNoteTool(),
+		t.updatePlaybookTool(),
 	}
 }

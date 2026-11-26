@@ -24,8 +24,8 @@ var plannerToolNames = map[string]bool{
 	"steer_work": true, "report_finding": true, "list_companies": true,
 	"list_assets": true, "add_company_scope": true, "add_task_scope": true,
 	"list_untested_assets": true, "TodoWrite": true, "planner_decision": true,
-	// Unified Task Commander tools (model tiering, anti-hallucination retraction, asset-scoped intel).
-	"list_llm_profiles": true, "retract_fact": true, "record_asset_note": true,
+	// Unified Task Commander tools (model tiering, anti-hallucination retraction, asset-scoped intel, L0 playbook).
+	"list_llm_profiles": true, "retract_fact": true, "record_asset_note": true, "update_playbook": true,
 	// Experience retrieval is optional and never grants target execution.
 	"ask_experience": true, "experience_search": true, "experience_get": true, "experience_feedback": true, "experience_stats": true,
 }
@@ -46,7 +46,9 @@ const plannerCommanderInstruction = `
 1. **先看 L1 链路与墓碑**：先扫 graph_overview 的 chain_view、running_intents（含探针告警 alerts）、recent_stopped_intents 与 retracted_facts。已被止损（stopped）或已撤回（retracted）的方向除非出现实质性新证据，禁止原地重派。
 2. **先核查再止损**：遇到探针告警（idle_stall / consecutive_errors / repeated_tool_loop / long_run_no_output）或 unverified/disputed 高影响事实时，先调 get_worker_trace / node_detail 核对原始输出，再决定 steer_work 纠偏、kill_work（必填 reason 留墓碑）或 retract_fact（自动级联止损下游意图）。
 3. **主动模型分级**：广度侦察、常规指纹/目录/基础验证留空 pinned_profile_id（走默认快模型）；仅当弱模型卡住、或面对复杂业务逻辑/越权/多步利用链时，结合 llm_profiles（或 list_llm_profiles）在 add_intent 中指定强模型或跨厂商模型的 pinned_profile_id 破局；突破完成后机械收尾回到默认档。
-4. **同资产实时共享**：一旦确认可复用的资产级特征（WAF 触发规则、HTTP 200 软鉴权失败特征、有效测试会话/鉴权头规范、真实框架版本），立即用 record_asset_note（或 steer_work 的 also_asset_note=true）锚定到对应 asset_ids，让同资产在跑与后续 Worker 直接复用，不再重复踩坑。`
+4. **同资产实时共享**：一旦确认可复用的资产级特征（WAF 触发规则、HTTP 200 软鉴权失败特征、有效测试会话/鉴权头规范、真实框架版本），立即用 record_asset_note（或 steer_work 的 also_asset_note=true）锚定到对应 asset_ids，让同资产在跑与后续 Worker 直接复用，不再重复踩坑。
+5. **动态时间预算（budget_tier / run_seconds）**：在 add_intent 中按任务复杂度合理配时——轻量探活/单项复核传 budget_tier="quick"(10m)；常规扫描用默认/standard(20m)；复杂多步链、逆向或升档慢推理强模型时传 budget_tier="deep"(40m)；高分残局硬骨头传 budget_tier="endgame"(60m) 或精确 run_seconds(180~3600)，减少中途超时重建税。
+6. **L0 战术剧本（PLAYBOOK.json）**：尾部附带当前 PLAYBOOK.json（硬上限 2.5KB，含 phase / global_rules / hypotheses / 只读 shared_index）。用 update_playbook 维护阶段节奏、运行期热补丁（≤8 条）与未解高价值目标假设（每目标≤5 条）；严禁写流水账，无确定性反证（如源码/实测明确拦截）禁止标 disproved（弱模型超时只能标 inconclusive）；已解决或封矿目标及时 remove_targets 清理。`
 
 type plannerRoundPolicy struct {
 	mu             sync.Mutex
@@ -131,28 +133,227 @@ func (p *plannerRoundPolicy) hooks() *hook.Registry {
 	})
 }
 
-// Only historical digest prose is shortened. User goals, constraints, hints,
-// live intents and source IDs are preserved; full digest bodies remain in DB.
-func plannerCompactOverview(view map[string]any) map[string]any {
-	copyView := make(map[string]any, len(view)+1)
-	for k, v := range view {
-		copyView[k] = v
+const (
+	contractedHumanHintsCap     = 12
+	contractedHumanHintRunes    = 800
+	contractedReviewHintsCap    = 2
+	contractedReviewHintRunes   = 360
+	contractedColdDigestsInline = 5
+	contractedColdDigestRunes   = 220
+	contractedColdIndexCap      = 16
+	contractedColdIndexRunes    = 48
+	contractedRecentDoneCap     = 8
+	contractedRecentFactsCap    = 12
+	contractedRecentSummaryRune = 160
+	contractedStoppedCap        = 6
+	contractedStoppedRune       = 120
+	contractedFindingRunes      = 180
+	contractedTaskDescRunes     = 800
+)
+
+func isChainReviewHint(entry map[string]any) bool {
+	if origin, _ := entry["origin"].(string); origin == ChainReviewerKey {
+		return true
 	}
-	if list, ok := view["cold_digests"].([]map[string]any); ok {
-		out := make([]map[string]any, 0, len(list))
-		for _, entry := range list {
-			item := make(map[string]any, len(entry)+1)
-			for k, v := range entry {
-				item[k] = v
+	if text, _ := entry["text"].(string); strings.HasPrefix(strings.TrimSpace(text), "【链路复盘建议") {
+		return true
+	}
+	return false
+}
+
+func cloneMap(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src)+1)
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func truncateFieldRunes(entry map[string]any, key string, limit int) bool {
+	s, ok := entry[key].(string)
+	if !ok {
+		return false
+	}
+	r := []rune(s)
+	if len(r) <= limit {
+		return false
+	}
+	entry[key] = string(r[:limit]) + "…"
+	return true
+}
+
+func firstLineSnippet(s string, maxRunes int) string {
+	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r", " "), "\n", " "))
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
+}
+
+func contractHintList(hints []map[string]any, maxReviewHints int) (kept []map[string]any, archivedReviewIDs []int64, overflowHumanIDs []int64) {
+	var human, review []map[string]any
+	for _, h := range hints {
+		if isChainReviewHint(h) {
+			review = append(review, h)
+		} else {
+			human = append(human, h)
+		}
+	}
+	// hints arrive newest-first from ListByKind; preserve human hints first,
+	// then keep only the freshest automated chain_reviewer hints.
+	for i, h := range human {
+		if i >= contractedHumanHintsCap {
+			if id, ok := h["id"].(int64); ok && id > 0 {
+				overflowHumanIDs = append(overflowHumanIDs, id)
 			}
-			if body, ok := entry["body"].(string); ok && len([]rune(body)) > 400 {
-				item["body"] = string([]rune(body)[:400]) + "…"
+			continue
+		}
+		item := cloneMap(h)
+		if truncateFieldRunes(item, "text", contractedHumanHintRunes) {
+			item["text_truncated"] = true
+			item["detail_tool"] = "node_detail(id)"
+		}
+		kept = append(kept, item)
+	}
+	for i, h := range review {
+		if i >= maxReviewHints {
+			if id, ok := h["id"].(int64); ok && id > 0 {
+				archivedReviewIDs = append(archivedReviewIDs, id)
+			}
+			continue
+		}
+		item := cloneMap(h)
+		if truncateFieldRunes(item, "text", contractedReviewHintRunes) {
+			item["text_truncated"] = true
+			item["detail_tool"] = "node_detail(id)"
+		}
+		kept = append(kept, item)
+	}
+	return kept, archivedReviewIDs, overflowHumanIDs
+}
+
+func contractNodeSummaries(list []map[string]any, capN, maxRunes int) ([]map[string]any, int) {
+	omitted := 0
+	if capN > 0 && len(list) > capN {
+		omitted = len(list) - capN
+		list = list[:capN]
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, entry := range list {
+		item := cloneMap(entry)
+		if truncateFieldRunes(item, "summary", maxRunes) {
+			item["summary_truncated"] = true
+		}
+		out = append(out, item)
+	}
+	return out, omitted
+}
+
+// plannerCompactOverview builds a Sapper-style contracted situational view for
+// the planner's wake-up prompt without mutating the source map. Goals, human
+// hints, live intents, topology IDs and chain_view are preserved; bulk prose
+// (automated chain_reviewer hint archives, older cold digests, long summaries)
+// is contracted into compact previews and drill-down indices so long-running
+// explorations stay compact and preserve prompt-cache efficiency.
+func plannerCompactOverview(view map[string]any) map[string]any {
+	return compactOverview(view, contractedReviewHintsCap)
+}
+
+// workerCompactOverview contracts the read-only global awareness snapshot
+// injected into each worker's launch message, keeping human hints and concise
+// topology while dropping bulky periodic chain_reviewer archives.
+func workerCompactOverview(view map[string]any) map[string]any {
+	return compactOverview(view, 1)
+}
+
+func compactOverview(view map[string]any, maxReviewHints int) map[string]any {
+	copyView := cloneMap(view)
+	copyView["overview_mode"] = "contracted"
+
+	if hints, ok := view["hints"].([]map[string]any); ok {
+		kept, archivedReviews, overflowHuman := contractHintList(hints, maxReviewHints)
+		copyView["hints"] = kept
+		if len(archivedReviews) > 0 {
+			recent := archivedReviews
+			if len(recent) > 8 {
+				recent = recent[:8]
+			}
+			copyView["archived_review_hints"] = map[string]any{
+				"count":       len(archivedReviews),
+				"recent_ids":  recent,
+				"detail_tool": "node_detail(id) 可按需查阅历史复盘",
+			}
+		}
+		if len(overflowHuman) > 0 {
+			copyView["hints_more_ids"] = overflowHuman
+		}
+	}
+
+	if list, ok := view["cold_digests"].([]map[string]any); ok {
+		inlineN := len(list)
+		if inlineN > contractedColdDigestsInline {
+			inlineN = contractedColdDigestsInline
+		}
+		out := make([]map[string]any, 0, inlineN)
+		for _, entry := range list[:inlineN] {
+			item := cloneMap(entry)
+			if truncateFieldRunes(item, "body", contractedColdDigestRunes) {
 				item["body_truncated"] = true
-				item["detail_tool"] = "node_detail(id) 可取完整摘要正文"
+				item["detail_tool"] = "node_detail(id) / expand_digest(id) 可取完整摘要与成员"
 			}
 			out = append(out, item)
 		}
 		copyView["cold_digests"] = out
+		if len(list) > inlineN {
+			rest := list[inlineN:]
+			idxCap := len(rest)
+			if idxCap > contractedColdIndexCap {
+				idxCap = contractedColdIndexCap
+			}
+			index := make([]string, 0, idxCap)
+			for _, entry := range rest[:idxCap] {
+				body, _ := entry["body"].(string)
+				index = append(index, fmt.Sprintf("#%v(%vn): %s", entry["id"], entry["member_count"], firstLineSnippet(body, contractedColdIndexRunes)))
+			}
+			copyView["cold_digest_index"] = index
+			if len(rest) > idxCap {
+				copyView["cold_digest_index_omitted"] = len(rest) - idxCap
+			}
+		}
+	}
+
+	if list, ok := view["recent_done_intents"].([]map[string]any); ok {
+		trimmed, omitted := contractNodeSummaries(list, contractedRecentDoneCap, contractedRecentSummaryRune)
+		copyView["recent_done_intents"] = trimmed
+		if omitted > 0 {
+			copyView["recent_done_omitted"] = omitted
+		}
+	}
+	if list, ok := view["recent_facts"].([]map[string]any); ok {
+		trimmed, omitted := contractNodeSummaries(list, contractedRecentFactsCap, contractedRecentSummaryRune)
+		copyView["recent_facts"] = trimmed
+		if omitted > 0 {
+			copyView["recent_facts_omitted"] = omitted
+		}
+	}
+	if list, ok := view["recent_stopped_intents"].([]map[string]any); ok {
+		trimmed, _ := contractNodeSummaries(list, contractedStoppedCap, contractedStoppedRune)
+		for _, item := range trimmed {
+			truncateFieldRunes(item, "stop_reason", 100)
+		}
+		copyView["recent_stopped_intents"] = trimmed
+	}
+	if list, ok := view["finding_list"].([]map[string]any); ok {
+		trimmed, _ := contractNodeSummaries(list, len(list), contractedFindingRunes)
+		copyView["finding_list"] = trimmed
+	}
+	if taskMap, ok := view["task"].(map[string]any); ok {
+		tcopy := cloneMap(taskMap)
+		if truncateFieldRunes(tcopy, "description", contractedTaskDescRunes) {
+			tcopy["description_truncated"] = true
+		}
+		copyView["task"] = tcopy
 	}
 	return copyView
 }

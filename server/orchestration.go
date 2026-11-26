@@ -565,6 +565,8 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedFindingCaseTools()
 	s.seedSupervisorUpgrade()
 	s.seedPlannerCommanderTools()
+	s.seedPlannerEvolutionTools()
+	s.seedWorkerSubtaskTool()
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
 	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
 	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
@@ -602,6 +604,50 @@ func (s *Server) seedPlannerCommanderTools() {
 		}
 		schema, _ := json.Marshal(seed.Schema)
 		_, _ = s.m.pg.Exec(`UPDATE tools SET schema=$2, updated_at=now() WHERE key=$1 AND system`, seed.Key, schema)
+	}
+}
+
+// seedPlannerEvolutionTools grants update_playbook to planner on existing
+// databases and refreshes add_intent / update_playbook schemas & descriptions
+// so dynamic timeout budgets (budget_tier/run_seconds) and L0 PLAYBOOK.json
+// work immediately after upgrade.
+func (s *Server) seedPlannerEvolutionTools() {
+	const flag = "planner_evolution_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+	_ = s.m.pg.AddAgentToToolBinding("planner", []string{"update_playbook"})
+	refreshKeys := map[string]bool{
+		"add_intent":      true,
+		"update_playbook": true,
+	}
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if !refreshKeys[seed.Key] {
+			continue
+		}
+		schema, _ := json.Marshal(seed.Schema)
+		_, _ = s.m.pg.Exec(`UPDATE tools SET description=$2, schema=$3, updated_at=now() WHERE key=$1 AND system`,
+			seed.Key, seed.Desc, schema)
+	}
+}
+
+// seedWorkerSubtaskTool grants delegate_subtask to worker on existing databases
+// once so workers can delegate bounded 1-level sub-tasks immediately after upgrade.
+func (s *Server) seedWorkerSubtaskTool() {
+	const flag = "worker_subtask_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+	_ = s.m.pg.AddAgentToToolBinding("worker", []string{agent.SubtaskToolName})
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != agent.SubtaskToolName {
+			continue
+		}
+		schema, _ := json.Marshal(seed.Schema)
+		_, _ = s.m.pg.Exec(`UPDATE tools SET description=$2, schema=$3, updated_at=now() WHERE key=$1 AND system`,
+			seed.Key, seed.Desc, schema)
 	}
 }
 
