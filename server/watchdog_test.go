@@ -128,3 +128,15 @@ func TestSelectSameFamilyHealthyRotation(t *testing.T) {
 		t.Fatalf("exhausted family id=%d, want 0", id)
 	}
 }
+
+func TestTaskExecutionRequeueOnShutdown(t *testing.T) {
+	if !taskExecutionRequeueOnCancel(agent.AbortShutdown) {
+		t.Fatal("AbortShutdown must requeue in-flight intent to open instead of marking blocked")
+	}
+	if !taskExecutionRequeueOnCancel(agent.AbortPausedByUser) {
+		t.Fatal("AbortPausedByUser must still requeue to open")
+	}
+	if taskExecutionRequeueOnCancel(agent.AbortGoalMet) {
+		t.Fatal("AbortGoalMet must NOT requeue to open")
+	}
+}

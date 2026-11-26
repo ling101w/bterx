@@ -1363,12 +1363,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.touch(t.ID)
 		return true
 	}
-	// if a pause cancelled this run mid-flight, return the intent to the frontier
-	// so it is re-claimed on resume — the worker will resume the prior LLM
-	// conversation from its transcript instead of restarting from scratch.
-	if ectx.Err() != nil && taskExecutionPaused(context.Cause(ectx)) {
+	// if a pause or graceful process shutdown cancelled this run mid-flight,
+	// return the intent to the frontier (open) so it is re-claimed on resume/restart
+	// instead of getting stranded as 'blocked' — the worker will resume the prior
+	// LLM conversation from its transcript with a re-sent mission brief.
+	if ectx.Err() != nil && taskExecutionRequeueOnCancel(context.Cause(ectx)) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
-			log.Printf("[worker %s] task %s 意图 #%d 任务暂停回退失败: %v", name, t.ID, intent.ID, err)
+			log.Printf("[worker %s] task %s 意图 #%d 中断回退 open 失败: %v", name, t.ID, intent.ID, err)
 		}
 		return true
 	}
@@ -1550,6 +1551,10 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 		e.runIntent(ctx, t, "chat", worker, node, requestID, agentMessage)
 	}()
 	return nil
+}
+
+func taskExecutionRequeueOnCancel(cause error) bool {
+	return taskExecutionPaused(cause) || errors.Is(cause, agent.AbortShutdown)
 }
 
 func taskExecutionPaused(cause error) bool {
