@@ -40,12 +40,12 @@ func TestPlaybookValidationAndGuards(t *testing.T) {
 		t.Fatalf("expected concrete disproved ref to pass, got %v", err)
 	}
 
-	// 5. >8 global_rules rejected.
-	pb.GlobalRules = []string{"r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"}
+	// 5. >10 global_rules rejected.
+	pb.GlobalRules = []string{"r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"}
 	if err := ValidatePlaybook(&pb); err == nil {
-		t.Fatal("expected >8 global_rules to fail")
+		t.Fatal("expected >10 global_rules to fail")
 	}
-	pb.GlobalRules = pb.GlobalRules[:8]
+	pb.GlobalRules = pb.GlobalRules[:10]
 
 	// 6. >5 hypotheses on one target_id rejected.
 	pb.Hypotheses = nil
@@ -60,18 +60,18 @@ func TestPlaybookValidationAndGuards(t *testing.T) {
 		t.Fatal("expected >5 hypotheses for one target to fail")
 	}
 
-	// 7. Hard 2.5KB byte ceiling enforced.
+	// 7. Hard 4KB byte ceiling enforced.
 	big := Playbook{Phase: "salvage"}
-	for i := 0; i < 25; i++ {
+	for i := 0; i < 35; i++ {
 		big.Hypotheses = append(big.Hypotheses, PlaybookHypothesis{
-			TargetID:    "target-" + string(rune('a'+i)),
+			TargetID:    "target-" + string(rune('a'+(i%26))) + string(rune('0'+(i/26))),
 			Path:        strings.Repeat("x", 120),
 			Status:      HypothesisActive,
 			EvidenceRef: "fact#999",
 		})
 	}
 	if err := ValidatePlaybook(&big); err == nil {
-		t.Fatal("expected >2.5KB playbook to fail validation")
+		t.Fatal("expected >4KB playbook to fail validation")
 	}
 }
 

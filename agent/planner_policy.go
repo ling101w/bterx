@@ -48,7 +48,7 @@ const plannerCommanderInstruction = `
 3. **主动模型分级**：广度侦察、常规指纹/目录/基础验证留空 pinned_profile_id（走默认快模型）；仅当弱模型卡住、或面对复杂业务逻辑/越权/多步利用链时，结合 llm_profiles（或 list_llm_profiles）在 add_intent 中指定强模型或跨厂商模型的 pinned_profile_id 破局；突破完成后机械收尾回到默认档。
 4. **同资产实时共享**：一旦确认可复用的资产级特征（WAF 触发规则、HTTP 200 软鉴权失败特征、有效测试会话/鉴权头规范、真实框架版本），立即用 record_asset_note（或 steer_work 的 also_asset_note=true）锚定到对应 asset_ids，让同资产在跑与后续 Worker 直接复用，不再重复踩坑。
 5. **动态时间预算（budget_tier / run_seconds）**：在 add_intent 中按任务复杂度合理配时——轻量探活/单项复核传 budget_tier="quick"(10m)；常规扫描用默认/standard(20m)；复杂多步链、逆向或升档慢推理强模型时传 budget_tier="deep"(40m)；高分残局硬骨头传 budget_tier="endgame"(60m) 或精确 run_seconds(180~3600)，减少中途超时重建税。
-6. **L0 战术剧本（PLAYBOOK.json）**：尾部附带当前 PLAYBOOK.json（硬上限 2.5KB，含 phase / global_rules / hypotheses / 只读 shared_index）。用 update_playbook 维护阶段节奏、运行期热补丁（≤8 条）与未解高价值目标假设（每目标≤5 条）；严禁写流水账，无确定性反证（如源码/实测明确拦截）禁止标 disproved（弱模型超时只能标 inconclusive）；已解决或封矿目标及时 remove_targets 清理。`
+6. **L0 战术剧本（PLAYBOOK.json）**：尾部附带当前 PLAYBOOK.json（硬上限 4KB，含 phase / global_rules / hypotheses / 只读 shared_index）。用 update_playbook 维护阶段节奏（≤120 字）、运行期热补丁（≤10 条，单条 ≤240 字）与未解高价值目标假设（每目标 ≤5 条）；严禁写流水账或把长串历史封矿名硬塞进 global_rules，无确定性反证（如源码/实测明确拦截）禁止标 disproved（弱模型超时只能标 inconclusive）；已解决或封矿目标及时 remove_targets 清理。`
 
 type plannerRoundPolicy struct {
 	mu             sync.Mutex

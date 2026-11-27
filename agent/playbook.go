@@ -16,14 +16,14 @@ import (
 
 const (
 	playbookFileName         = "PLAYBOOK.json"
-	playbookMaxBytes         = 2560 // strict 2.5KB serialized cap
-	playbookMaxRules         = 8
+	playbookMaxBytes         = 4096 // strict 4KB serialized cap
+	playbookMaxRules         = 10
 	playbookMaxHypPerTarget  = 5
-	playbookMaxPhaseRunes    = 80
-	playbookMaxRuleRunes     = 160
+	playbookMaxPhaseRunes    = 120
+	playbookMaxRuleRunes     = 240
 	playbookMaxTargetRunes   = 64
-	playbookMaxPathRunes     = 160
-	playbookMaxRefRunes      = 120
+	playbookMaxPathRunes     = 200
+	playbookMaxRefRunes      = 140
 	playbookMaxSharedIdxByte = 320
 )
 
@@ -104,7 +104,7 @@ func savePlaybookUnlocked(path string, pb Playbook) error {
 		return err
 	}
 	if len(b) > playbookMaxBytes {
-		return fmt.Errorf("PLAYBOOK.json 序列化后为 %d 字节，超过硬上限 %d 字节（2.5KB）；请精简文案或通过 remove_targets 清理已解决/关闭目标后再保存", len(b), playbookMaxBytes)
+		return fmt.Errorf("PLAYBOOK.json 序列化后为 %d 字节，超过硬上限 %d 字节（4KB）；请精简文案或通过 remove_targets 清理已解决/关闭目标后再保存", len(b), playbookMaxBytes)
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
@@ -298,7 +298,7 @@ func ValidatePlaybook(pb *Playbook) error {
 		return err
 	}
 	if len(b) > playbookMaxBytes {
-		return fmt.Errorf("PLAYBOOK.json 序列化后为 %d 字节，超过硬上限 %d 字节（2.5KB）；请精简文案或通过 remove_targets 清理已解决/关闭目标", len(b), playbookMaxBytes)
+		return fmt.Errorf("PLAYBOOK.json 序列化后为 %d 字节，超过硬上限 %d 字节（4KB）；请精简文案或通过 remove_targets 清理已解决/关闭目标", len(b), playbookMaxBytes)
 	}
 	return nil
 }
@@ -415,7 +415,7 @@ func collectResolvedPlaybookTargets(workDir string, ts *db.ExplorationStore) map
 func renderPlaybookTail(pb Playbook, pruned []string) string {
 	empty := pb.Phase == "" && len(pb.GlobalRules) == 0 && len(pb.Hypotheses) == 0 && pb.SharedIndex == ""
 	if empty {
-		return "\n\n【L0 战术剧本 PLAYBOOK.json（当前为空，硬上限 2.5KB）】：{}\n提示：进入多轮攻坚/发现跨目标规律或需跟踪未解高价值假设时，可用 update_playbook 维护 phase / global_rules / hypotheses（严禁写流水账；无确定性反证禁标 disproved）。"
+		return "\n\n【L0 战术剧本 PLAYBOOK.json（当前为空，硬上限 4KB）】：{}\n提示：进入多轮攻坚/发现跨目标规律或需跟踪未解高价值假设时，可用 update_playbook 维护 phase / global_rules / hypotheses（严禁写流水账；无确定性反证禁标 disproved）。"
 	}
 	b, err := json.Marshal(pb)
 	if err != nil {
@@ -425,7 +425,7 @@ func renderPlaybookTail(pb Playbook, pruned []string) string {
 	if len(pruned) > 0 {
 		note = fmt.Sprintf("（运行时已自动清理已解决/环境异常目标：%s）", strings.Join(pruned, ", "))
 	}
-	return fmt.Sprintf("\n\n【L0 战术剧本 PLAYBOOK.json（尾挂态，硬上限 2.5KB；用 update_playbook 增量维护）%s】：\n%s", note, string(b))
+	return fmt.Sprintf("\n\n【L0 战术剧本 PLAYBOOK.json（尾挂态，硬上限 4KB；用 update_playbook 增量维护）%s】：\n%s", note, string(b))
 }
 
 type playbookUpdateInput struct {
@@ -502,13 +502,13 @@ func applyPlaybookUpdate(pb *Playbook, in playbookUpdateInput) {
 
 func (t *ToolSet) updatePlaybookTool() actool.CoreTool {
 	return t.writeExpTool("update_playbook",
-		"维护本任务的 L0 强结构化战术剧本 PLAYBOOK.json（硬上限 2.5KB，禁止写流水账）。仅允许维护 3 个可写字段（第 4 个字段 shared_index 由运行时自动生成、只读）：\n"+
-			"1. phase：当前阶段与调度节奏（如 sweep / deep_push / salvage）；\n"+
-			"2. global_rules（上限 8 条）：本场运行期热补丁规则（如故障渠道避让、专项提交策略、跨目标共性 WAF 规则）；\n"+
-			"3. hypotheses（每 target_id 最多 5 条）：跟踪未解高价值目标/题目的关键路径假设，严格区分 active / disproved / inconclusive；标 disproved 必须给确定性反证 evidence_ref（如 fact#ID / 代码拦截点），弱模型超时未果只能标 inconclusive；目标已解决/封矿/env_broken 请用 remove_targets 及时清理释放 2.5KB 配额。",
+		"维护本任务的 L0 强结构化战术剧本 PLAYBOOK.json（硬上限 4KB，禁止写流水账）。仅允许维护 3 个可写字段（第 4 个字段 shared_index 由运行时自动生成、只读）：\n"+
+			"1. phase（≤120 字）：当前阶段与调度节奏（如 sweep / deep_push / salvage）；\n"+
+			"2. global_rules（最多 10 条，单条 ≤240 字）：本场运行期热补丁规则（如故障渠道避让、范围红线、跨目标共性 WAF 规则；勿把历史封矿清单全塞进这里，善用图谱 digest/fact 编号）；\n"+
+			"3. hypotheses（每 target_id 最多 5 条，path ≤200 字）：跟踪未解高价值目标/题目的关键路径假设，严格区分 active / disproved / inconclusive；标 disproved 必须给确定性反证 evidence_ref（如 fact#ID / 代码拦截点），弱模型超时未果只能标 inconclusive；目标已解决/封矿/env_broken 请用 remove_targets 及时清理释放 4KB 配额。",
 		obj(map[string]any{
-			"phase":        str("可选：更新当前阶段与调度节奏，如 sweep / deep_push / salvage"),
-			"global_rules": map[string]any{"type": "array", "maxItems": playbookMaxRules, "items": map[string]any{"type": "string"}, "description": "可选：整体替换全局热补丁规则（最多 8 条）"},
+			"phase":        str("可选：更新当前阶段与调度节奏（≤120 字），如 sweep / deep_push / salvage"),
+			"global_rules": map[string]any{"type": "array", "maxItems": playbookMaxRules, "items": map[string]any{"type": "string"}, "description": "可选：整体替换全局热补丁规则（最多 10 条，单条 ≤240 字）"},
 			"add_rules":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：增量追加全局热补丁规则"},
 			"remove_rules": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：按精确文本移除过期规则"},
 			"upsert_hypotheses": map[string]any{

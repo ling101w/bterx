@@ -540,6 +540,7 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 			fmt.Fprintf(&sb, "- （其余 %d 个上游锚点已省略）\n", omitted)
 		}
 	}
+	sb.WriteString("\n请直接输出精炼中文结论正文（附上 #id 引用），禁止长篇推演、禁止逐条复抄原文。")
 	return sb.String()
 }
 
@@ -650,7 +651,43 @@ func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByI
 	if lastPartial != "" {
 		return lastPartial, nil
 	}
+	// If an always-thinking gateway ignored Thinking="disabled" and burned the
+	// entire max output cap in reasoning with zero visible text, never spin on
+	// the exact same oversized block every 60s: split larger blocks in half and
+	// compress each piece, or synthesize a deterministic extractive digest for
+	// tiny blocks so compaction always makes forward progress.
+	if lastStop == "max_tokens" && lastHadThinking {
+		if len(b.Members) >= 4 {
+			mid := len(b.Members) / 2
+			left := block{Members: b.Members[:mid], Anchors: b.Anchors}
+			right := block{Members: b.Members[mid:], Anchors: b.Anchors}
+			log.Printf("[compaction] split oversized thinking-exhausted block=%v into [%d, %d]", b.Members, len(left.Members), len(right.Members))
+			leftBody, errL := c.compress(ctx, g, left, nodeByID)
+			rightBody, errR := c.compress(ctx, g, right, nodeByID)
+			if errL == nil && errR == nil {
+				return strings.TrimSpace(leftBody + "\n" + rightBody), nil
+			}
+		}
+		log.Printf("[compaction] extractive fallback for thinking-exhausted block=%v (max_tokens=%d)", b.Members, lastMaxTokens)
+		return buildExtractiveFallbackBody(b, nodeByID), nil
+	}
 	return "", fmt.Errorf("empty body from model (stop=%q max_tokens=%d thinking=%v)", lastStop, lastMaxTokens, lastHadThinking)
+}
+
+func buildExtractiveFallbackBody(b block, nodeByID map[int64]*db.Node) string {
+	var sb strings.Builder
+	sb.WriteString("【自动精简汇总（推理模型超输出上限降级）】")
+	for _, id := range b.Members {
+		n := nodeByID[id]
+		sum := truncateRunes(strings.TrimSpace(nodeSummary(n)), 100)
+		if sum == "" {
+			continue
+		}
+		sb.WriteString("\n- ")
+		sb.WriteString(sum)
+		fmt.Fprintf(&sb, "（#%d）", id)
+	}
+	return sb.String()
 }
 
 // compressionSystemPrompt is the §4 body prompt.

@@ -262,7 +262,11 @@ func artifactSpec(dir string) string {
 // mkdir, no cross-worker name collisions.
 func workerArtifactSpec(runDir string) string {
 	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。" +
-		"\n**专项副手（delegate_subtask）**：遇到极占上下文的脏活（大型 JS bundle 逆向、海量日志/源码检索、协议签名提取等）时，可调用 delegate_subtask 同步委派 1 层短命副手（独立上下文、同目录、≤5 分钟、每意图限 3 次），拿回精炼结论再由你复核落库。"
+		"\n**专项副手（delegate_subtask，强烈建议优先使用）**：遇到以下高上下文消耗或重检索脏活时，**优先调用 `delegate_subtask`** 同步委派 1 层短命副手（独立上下文、同目录、≤5 分钟、每意图限 3 次），拿回精炼证据后再由你复核落库，避免撑爆主上下文：" +
+		"\n  1. 审计/检索 >500KB 的压缩 JS bundle、APK/JAR 反编译产物或大批量 HTTP 响应文件；" +
+		"\n  2. 跨多个目录/历史产出做模式挖掘、接口/凭据批量抽取或协议签名还原；" +
+		"\n  3. 多目标只读探活与响应汇总。" +
+		"\n**主机防 OOM 检索红线**：严禁对大体积压缩单行 JS/JSON 或整个任务根目录直接运行带通配回溯的 `grep -E '.{50,}...'` 或无范围 `grep -r`（极易吃光主机内存触发 OOM）；检索大文件一律用 `python3` 按块/按偏移窗口提取，或限定具体子目录并加 `--exclude-dir=_blobs --max-count=50`。"
 }
 
 // ensureRunDir builds and creates an agent's working directory under base:

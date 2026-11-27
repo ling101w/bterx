@@ -88,3 +88,24 @@ func TestJudgeConfigPreservesSecondaryProfileIDWhenOmitted(t *testing.T) {
 		t.Fatalf("GET round-trip failed: err=%v got=%+v", err, got)
 	}
 }
+
+func TestSecondaryReviewEnvelopeWrapsUserMessage(t *testing.T) {
+	p := &reviewCaptureProvider{}
+	in := intercept.ReviewInput{
+		Version:   5,
+		Tool:      "Bash",
+		Arguments: json.RawMessage(`{"command":"ls -la"}`),
+	}
+	prompt := intercept.EffectiveJudgePrompt(intercept.DefaultJudgePrompt)
+	reply, err := secondaryReviewCompletion(t.Context(), p, prompt, in)
+	if err != nil || intercept.ParseVerdict(reply).Action != "ask" {
+		t.Fatalf("unexpected secondary reply=%q err=%v", reply, err)
+	}
+	if p.request.MaxTokens < 2048 {
+		t.Fatalf("MaxTokens=%d, want >=2048", p.request.MaxTokens)
+	}
+	userText := p.request.Messages[0].Content[0].Text
+	if !strings.Contains(userText, "【安全审计裁判任务】") || !strings.Contains(userText, `"tool_name":"Bash"`) || !strings.Contains(userText, `"decision":"allow|ask|deny"`) {
+		t.Fatalf("secondary review user message missing judging envelope or payload: %s", userText)
+	}
+}

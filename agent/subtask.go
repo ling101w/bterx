@@ -104,7 +104,7 @@ func subtaskSystemPrompt(role, runDir, proxyAddr, constraintText string, readOnl
 	sb.WriteString("你的唯一职责：在有限步数与时间内高效完成主 Worker 交给你的这一项具体子任务，然后返回精炼、带直接证据（文件路径、行号、命令关键输出、提取出的接口/签名/结论）的中文汇总。\n")
 	sb.WriteString("严格边界：\n")
 	sb.WriteString("1. 你没有图谱写回权限，也禁止发散探索任务之外的方向；把结论交给主 Worker 由它复核落库。\n")
-	sb.WriteString("2. 优先用脚本/命令行精准过滤提取，禁止把大段源码/HTML 原样倾倒进回复。\n")
+	sb.WriteString("2. 优先用脚本/命令行精准过滤提取，禁止把大段源码/HTML 原样倾倒进回复；严禁对大体积压缩单行 JS/JSON 执行回溯正则 `grep -E '.{50,}...'` 或跨任务全目录 `grep -r`，一律用 python3 按窗口/偏移读取防止 OOM。\n")
 	if readOnly {
 		sb.WriteString("3. 当前为只读模式（read_only=true）：禁止修改或写入任何文件。\n")
 	} else {

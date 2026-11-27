@@ -45,8 +45,8 @@ type coldParams struct {
 }
 
 const (
-	defaultColdMaxMembers = 24
-	defaultColdMaxBytes   = 32 * 1024 // ~16K tokens max per compactor LLM call
+	defaultColdMaxMembers = 12
+	defaultColdMaxBytes   = 16 * 1024 // ~8K tokens max per compactor LLM call (keeps thinking models from exhausting 16K output budget)
 )
 
 func defaultColdParams() coldParams {

@@ -195,3 +195,44 @@ func TestCompactorCompressRespectsCanceledContext(t *testing.T) {
 		t.Fatalf("calls=%d, want 0 when context already canceled", len(prov.reqs))
 	}
 }
+
+func TestCompactorCompressSplitsAndFallsBackOnExhaustedThinking(t *testing.T) {
+	nodes := map[int64]*db.Node{
+		1: {ID: 1, Kind: "intent", State: "done", Payload: []byte(`{"summary":"探测子域 A"}`)},
+		2: {ID: 2, Kind: "fact", State: "confirmed", Payload: []byte(`{"summary":"子域 A 仅返回 404"}`)},
+		3: {ID: 3, Kind: "intent", State: "done", Payload: []byte(`{"summary":"探测子域 B"}`)},
+		4: {ID: 4, Kind: "fact", State: "confirmed", Payload: []byte(`{"summary":"子域 B 需 SSO 登录"}`)},
+	}
+	g := newColdGraph(
+		[]cgNode{
+			{ID: 1, Kind: "intent", State: "done"},
+			{ID: 2, Kind: "fact", State: "confirmed"},
+			{ID: 3, Kind: "intent", State: "done"},
+			{ID: 4, Kind: "fact", State: "confirmed"},
+		},
+		[]cgEdge{{From: 1, Rel: "yields", To: 2}, {From: 3, Rel: "yields", To: 4}},
+	)
+	b := block{Members: []int64{1, 2, 3, 4}}
+	thinkingExhausted := fakeCompactionResp{
+		msg:  llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockThinking, Thinking: "超长思考..."}}},
+		stop: "max_tokens",
+	}
+	prov := &fakeCompactionProvider{
+		replies: []fakeCompactionResp{
+			// Full 4-member block exhausts 4096, 8192, 16384 -> triggers split into [1,2] and [3,4].
+			thinkingExhausted, thinkingExhausted, thinkingExhausted,
+			// Left half [1,2] succeeds cleanly at 4096.
+			{msg: llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("子域 A 仅 404（#1,#2）。")}}, stop: "end_turn"},
+			// Right half [3,4] still exhausts 4096, 8192, 16384 -> triggers deterministic extractive fallback.
+			thinkingExhausted, thinkingExhausted, thinkingExhausted,
+		},
+	}
+	c := NewCompactor(prov, "always-thinking")
+	body, err := c.compress(context.Background(), g, b, nodes)
+	if err != nil {
+		t.Fatalf("expected split + fallback to succeed, got err=%v", err)
+	}
+	if !strings.Contains(body, "#1,#2") || !strings.Contains(body, "#3") || !strings.Contains(body, "#4") {
+		t.Fatalf("unexpected merged body: %q", body)
+	}
+}
